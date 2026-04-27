@@ -2099,6 +2099,7 @@ def validate_answer_payload(
             reviewer_note=_reviewer_note_with_fallback(payload.get("reviewer_note")),
             failure_reason="answer_invalid",
         )
+    normalized_answer = answer.strip()
 
     answer_type = payload.get("answer_type")
     if not isinstance(answer_type, str) or answer_type not in ANSWER_TYPES:
@@ -2120,7 +2121,9 @@ def validate_answer_payload(
 
     retrieved_chunk_ids = {chunk.chunk_id for chunk in retrieved_chunks}
     valid_citation_ids: list[str] = []
+    seen_valid_citation_ids: set[str] = set()
     invalid_citation_ids: list[str] = []
+    seen_invalid_citation_ids: set[str] = set()
     for raw_citation_id in raw_citation_ids:
         if not isinstance(raw_citation_id, str) or not raw_citation_id.strip():
             return AnswerPayloadValidationResult(
@@ -2132,10 +2135,13 @@ def validate_answer_payload(
 
         citation_id = raw_citation_id.strip()
         if citation_id in retrieved_chunk_ids:
-            if citation_id not in valid_citation_ids:
+            if citation_id not in seen_valid_citation_ids:
+                seen_valid_citation_ids.add(citation_id)
                 valid_citation_ids.append(citation_id)
             continue
-        invalid_citation_ids.append(citation_id)
+        if citation_id not in seen_invalid_citation_ids:
+            seen_invalid_citation_ids.add(citation_id)
+            invalid_citation_ids.append(citation_id)
 
     reviewer_note = _reviewer_note_with_fallback(payload.get("reviewer_note"))
     if answer_type != ANSWER_TYPE_UNSUPPORTED and not valid_citation_ids:
@@ -2143,7 +2149,7 @@ def validate_answer_payload(
             usable=False,
             outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
             reviewer_note=reviewer_note,
-            answer=answer.strip(),
+            answer=normalized_answer,
             answer_type=answer_type,
             citation_ids=(),
             invalid_citation_ids=tuple(invalid_citation_ids),
@@ -2159,7 +2165,7 @@ def validate_answer_payload(
         usable=True,
         outcome=outcome,
         reviewer_note=reviewer_note,
-        answer=answer.strip(),
+        answer=normalized_answer,
         answer_type=answer_type,
         citation_ids=tuple(valid_citation_ids),
         invalid_citation_ids=tuple(invalid_citation_ids),
