@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 from shlex import join as shell_join
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Callable, Final, Mapping, Sequence
 
 from openpyxl import load_workbook
 
@@ -2606,6 +2606,102 @@ def _parse_evidence_display_value(value: str) -> list[str]:
     return [label for label in value.split("; ") if label]
 
 
+def prepare_questionnaire_run(
+    questionnaire: RuntimeQuestionnaire,
+) -> RuntimeQuestionnaire:
+    """Return one run-scoped questionnaire copy with cleared result fields."""
+    run_rows: list[dict[str, object]] = []
+    for row in questionnaire.rows:
+        run_row = dict(row)
+        run_row.update(
+            {
+                "Answer": "",
+                "Evidence": "",
+                "Confidence": "",
+                "Status": "",
+                "Reviewer Notes": "",
+                **make_result_row_defaults(),
+            }
+        )
+        run_rows.append(run_row)
+    return replace(questionnaire, rows=run_rows)
+
+
+def update_row_with_answer_result(
+    row_like: Mapping[str, object],
+    answer_result: GeneratedAnswerResult,
+    *,
+    index_action: str,
+    run_id: str,
+) -> dict[str, object]:
+    """Merge one generated answer result into the shared internal row contract."""
+    normalized_run_id = run_id.strip()
+    if not normalized_run_id:
+        raise ValueError("run_id must be a non-empty string.")
+
+    evidence_labels = [
+        citation.display_label for citation in answer_result.citations if citation.display_label
+    ]
+    reviewer_note = _reviewer_note_with_fallback(answer_result.reviewer_note)
+    updated_row = dict(row_like)
+    updated_row.update(
+        {
+            "Answer": answer_result.answer,
+            "Evidence": build_evidence_display_value(evidence_labels),
+            "Confidence": answer_result.confidence_band,
+            "Status": answer_result.status,
+            "Reviewer Notes": reviewer_note,
+            "answer": answer_result.answer,
+            "answer_type": answer_result.answer_type,
+            "citation_ids": list(answer_result.citation_ids),
+            "citations": list(answer_result.citations),
+            "confidence_score": answer_result.confidence_score,
+            "confidence_band": answer_result.confidence_band,
+            "status": answer_result.status,
+            "reviewer_note": reviewer_note,
+            "evidence_labels": evidence_labels,
+            "index_action": index_action,
+            "run_id": normalized_run_id,
+        }
+    )
+    return updated_row
+
+
+def run_questionnaire_answer_pipeline(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    index_status: ChromaIndexStatus,
+    run_id: str,
+    model: str = DEFAULT_OPENAI_ANSWER_MODEL,
+    openai_client: Any | None = None,
+    on_row_completed: Callable[[RuntimeQuestionnaire, int], None] | None = None,
+) -> RuntimeQuestionnaire:
+    """Fill one run-scoped questionnaire in order and expose incremental updates."""
+    run_questionnaire = prepare_questionnaire_run(questionnaire)
+    for row_index, row in enumerate(run_questionnaire.rows):
+        retrieved_chunks = retrieve_evidence_chunks_for_row(
+            row,
+            index_status=index_status,
+        )
+        question_text = str(row["question"])
+        answer_result = generate_answer_result(
+            question_text,
+            retrieved_chunks,
+            model=model,
+            openai_client=openai_client,
+        )
+        updated_row = update_row_with_answer_result(
+            row,
+            answer_result,
+            index_action=index_status.index_action,
+            run_id=run_id,
+        )
+        run_questionnaire.rows[row_index] = updated_row
+        if on_row_completed is not None:
+            on_row_completed(run_questionnaire, row_index)
+    return run_questionnaire
+
+
 def _build_runtime_question_row(
     *,
     question_id: str,
@@ -2932,6 +3028,7 @@ __all__ = [
     "normalize_evidence_text",
     "persist_curated_evidence_chunks",
     "persist_evidence_chunks",
+    "prepare_questionnaire_run",
     "question_order_index",
     "rebuild_curated_evidence_index",
     "record_indexed_workspace_state",
@@ -2940,11 +3037,13 @@ __all__ = [
     "resolve_validated_citations",
     "review_priority_sort_key",
     "review_status_for_score",
+    "run_questionnaire_answer_pipeline",
     "RuntimeQuestionnaire",
     "runtime_evidence_directory",
     "runtime_manifest_path",
     "runtime_questionnaire_path",
     "score_answer_confidence",
+    "update_row_with_answer_result",
     "validate_answer_payload",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
