@@ -141,6 +141,15 @@ ANSWER_OPENING_TOKENS: Final[tuple[str, ...]] = (
     "Partially.",
     "Not stated.",
 )
+DOCUMENT_TYPE_MARKDOWN: Final[str] = "markdown"
+DOCUMENT_TYPE_TEXT: Final[str] = "text"
+DOCUMENT_TYPE_PDF: Final[str] = "pdf"
+TEXT_EVIDENCE_SUFFIXES: Final[tuple[str, ...]] = (".md", ".txt")
+CURATED_TEXT_EVIDENCE_FILE_NAMES: Final[tuple[str, ...]] = tuple(
+    evidence_file_name
+    for evidence_file_name in EXPECTED_EVIDENCE_FILE_NAMES
+    if Path(evidence_file_name).suffix.lower() in TEXT_EVIDENCE_SUFFIXES
+)
 
 RUNTIME_DIRECTORIES: Final[tuple[Path, ...]] = (
     RUNTIME_QUESTIONNAIRES_DIR,
@@ -280,6 +289,17 @@ class RuntimeQuestionnaire:
             self.rows,
             columns=(*self.visible_columns, *internal_columns),
         )
+
+
+@dataclass(frozen=True)
+class EvidenceDocument:
+    """One loaded evidence document before normalization and chunking."""
+
+    source_file_name: str
+    source_path: Path
+    doc_type: str
+    text: str
+    page_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -681,11 +701,46 @@ def runtime_questionnaire_path() -> Path:
     return RUNTIME_QUESTIONNAIRES_DIR / QUESTIONNAIRE_FILE_NAME
 
 
+def runtime_evidence_directory() -> Path:
+    """Return the curated runtime evidence directory inside the workspace."""
+    return RUNTIME_EVIDENCE_DIR
+
+
 def _normalize_workbook_text_cell(value: object) -> str:
     """Convert a workbook cell value into the canonical in-memory text form."""
     if value is None:
         return ""
     return str(value).strip()
+
+
+def load_text_evidence_document(source_path: Path) -> EvidenceDocument:
+    """Load one markdown or plain-text evidence file into the common document shape."""
+    suffix = source_path.suffix.lower()
+    if suffix not in TEXT_EVIDENCE_SUFFIXES:
+        supported_suffixes = ", ".join(TEXT_EVIDENCE_SUFFIXES)
+        raise ValueError(
+            f"Unsupported text evidence file type for {source_path.name}: "
+            f"expected one of {supported_suffixes}."
+        )
+
+    doc_type = DOCUMENT_TYPE_MARKDOWN if suffix == ".md" else DOCUMENT_TYPE_TEXT
+    return EvidenceDocument(
+        source_file_name=source_path.name,
+        source_path=source_path,
+        doc_type=doc_type,
+        text=source_path.read_text(encoding="utf-8"),
+    )
+
+
+def load_curated_text_evidence_documents(
+    evidence_dir: Path | None = None,
+) -> tuple[EvidenceDocument, ...]:
+    """Load the four curated markdown policy files in stable runtime order."""
+    base_directory = evidence_dir or runtime_evidence_directory()
+    return tuple(
+        load_text_evidence_document(base_directory / evidence_file_name)
+        for evidence_file_name in CURATED_TEXT_EVIDENCE_FILE_NAMES
+    )
 
 
 def _parse_evidence_display_value(value: str) -> list[str]:
@@ -870,9 +925,13 @@ __all__ = [
     "CLOSEOUT_AUDIT_RULES",
     "DATA_DIR",
     "DEMO_MODE_LABEL",
+    "DOCUMENT_TYPE_MARKDOWN",
+    "DOCUMENT_TYPE_PDF",
+    "DOCUMENT_TYPE_TEXT",
     "E2E_TESTS_DIR",
     "E2E_TEST_LOGS_DIR",
     "ENCRYPTION_POLICY_FILE_NAME",
+    "EvidenceDocument",
     "EXPECTED_OUTCOMES_FIXTURE_PATH",
     "EXPECTED_EVIDENCE_FILE_NAMES",
     "EXPECTED_QUESTION_IDS",
@@ -918,6 +977,7 @@ __all__ = [
     "OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES",
     "OUTPUTS_DIR",
     "PARTIAL_SCORE",
+    "CURATED_TEXT_EVIDENCE_FILE_NAMES",
     "QUESTIONNAIRE_FILE_NAME",
     "QUESTION_SHEET_NAME",
     "QUICK_CONFIDENCE_COMMAND_NAMES",
@@ -948,6 +1008,7 @@ __all__ = [
     "TEST_FIXTURES_DIR",
     "TestSeam",
     "TEST_SEAMS",
+    "TEXT_EVIDENCE_SUFFIXES",
     "UI_TESTS_DIR",
     "UI_TEST_LOGS_DIR",
     "UNIT_TESTS_DIR",
@@ -962,11 +1023,14 @@ __all__ = [
     "build_citation_display_label",
     "build_evidence_display_value",
     "confidence_band_for_score",
+    "load_curated_text_evidence_documents",
     "load_runtime_questionnaire",
+    "load_text_evidence_document",
     "make_result_row_defaults",
     "question_order_index",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
+    "runtime_evidence_directory",
     "runtime_questionnaire_path",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
