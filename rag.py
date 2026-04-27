@@ -10,6 +10,8 @@ from shlex import join as shell_join
 from typing import Any, Callable, Final, Mapping, Sequence
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parent
 
@@ -102,6 +104,23 @@ CONFIDENCE_BAND_LOW: Final[str] = "Low"
 
 READY_STATUS_FILL: Final[str] = "light_green"
 REVIEW_STATUS_FILL: Final[str] = "light_amber"
+ANSWERED_WORKBOOK_COLUMN_WIDTHS: Final[Mapping[str, float]] = {
+    "Question ID": 14,
+    "Category": 18,
+    "Question": 52,
+    "Answer": 52,
+    "Evidence": 32,
+    "Confidence": 14,
+    "Status": 18,
+    "Reviewer Notes": 40,
+}
+STATUS_FILL_RGB_BY_NAME: Final[Mapping[str, str]] = {
+    READY_STATUS_FILL: "FFE2F0D9",
+    REVIEW_STATUS_FILL: "FFFFF2CC",
+}
+WRAPPED_EXPORT_COLUMNS: Final[frozenset[str]] = frozenset(
+    {"Question", "Answer", "Evidence", "Reviewer Notes"}
+)
 
 SUPPORTED_WITH_ONE_CITATION_SCORE: Final[float] = 0.78
 SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE: Final[float] = 0.90
@@ -2657,7 +2676,52 @@ def build_answered_questionnaire_workbook(
             _visible_export_cell_value(row, column_name)
             for column_name in VISIBLE_EXPORT_COLUMNS
         ])
+    _apply_answered_questionnaire_worksheet_style(worksheet)
     return workbook
+
+
+def _status_fill_name_for_status(status: object) -> str | None:
+    if status == STATUS_READY_FOR_REVIEW:
+        return READY_STATUS_FILL
+    if status == STATUS_NEEDS_REVIEW:
+        return REVIEW_STATUS_FILL
+    return None
+
+
+def _apply_answered_questionnaire_worksheet_style(worksheet: Any) -> None:
+    """Apply the planned readability and review-triage styling to the export sheet."""
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    header_font = Font(bold=True)
+    default_alignment = Alignment(vertical="top")
+    wrapped_alignment = Alignment(vertical="top", wrap_text=True)
+    status_fills = {
+        fill_name: PatternFill(fill_type="solid", fgColor=rgb)
+        for fill_name, rgb in STATUS_FILL_RGB_BY_NAME.items()
+    }
+
+    for column_index, column_name in enumerate(VISIBLE_EXPORT_COLUMNS, start=1):
+        column_letter = get_column_letter(column_index)
+        worksheet.column_dimensions[column_letter].width = ANSWERED_WORKBOOK_COLUMN_WIDTHS[
+            column_name
+        ]
+        alignment = (
+            wrapped_alignment
+            if column_name in WRAPPED_EXPORT_COLUMNS
+            else default_alignment
+        )
+        for row_index, cell in enumerate(worksheet[column_letter], start=1):
+            cell.alignment = alignment
+            if row_index == 1:
+                cell.font = header_font
+                continue
+            if column_name != "Status":
+                continue
+            fill_name = _status_fill_name_for_status(cell.value)
+            if fill_name is None:
+                continue
+            cell.fill = status_fills[fill_name]
 
 
 def write_answered_questionnaire(
