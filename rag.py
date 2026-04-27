@@ -1568,6 +1568,8 @@ def ensure_curated_evidence_index(
             reason="workspace_hash_changed",
         )
 
+    # Integrity or manifest-read failures stay blocked here so the later stale-state
+    # guard can decide whether the safest outcome is a rebuild or an operator-visible stop.
     return _index_status_from_reuse_status(reuse_status)
 
 
