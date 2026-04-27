@@ -144,9 +144,12 @@ class AppRunSectionTest(unittest.TestCase):
             "Completed 0 of 3 questions.",
             [caption.value for caption in at.caption],
         )
-        self.assertIn(
-            "Recovery-only controls for rebuilding the local index or resetting the curated demo workspace.",
-            [caption.value for caption in at.caption],
+        self.assertTrue(
+            any(
+                "Recovery-only controls." in caption.value
+                and "reset the curated demo workspace" in caption.value
+                for caption in at.caption
+            )
         )
         self.assertIn(
             "Current question status will appear here once the run starts.",

@@ -630,8 +630,8 @@ def render_workspace_section() -> WorkspaceSnapshot:
     )
     with st.expander("Advanced"):
         st.caption(
-            "Recovery-only controls for rebuilding the local index or resetting the "
-            "curated demo workspace."
+            "Recovery-only controls. Use these when you need to rebuild the local index "
+            "or reset the curated demo workspace."
         )
         rebuild_clicked = st.button("Rebuild Index", use_container_width=True)
         reset_clicked = st.button("Reset Demo", use_container_width=True)
