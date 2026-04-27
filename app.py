@@ -629,6 +629,10 @@ def render_workspace_section() -> WorkspaceSnapshot:
         use_container_width=True,
     )
     with st.expander("Advanced"):
+        st.caption(
+            "Recovery-only controls for rebuilding the local index or resetting the "
+            "curated demo workspace."
+        )
         rebuild_clicked = st.button("Rebuild Index", use_container_width=True)
         reset_clicked = st.button("Reset Demo", use_container_width=True)
 
@@ -714,6 +718,11 @@ def main() -> None:
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
     st.markdown(f"`{DEMO_MODE_LABEL}`")
+    st.write(
+        "Single curated workspace demo: one bundled questionnaire, one bundled evidence "
+        "pack, and one local review flow. This app does not branch into generic uploads "
+        "or multi-workspace intake."
+    )
     workspace_snapshot = render_workspace_section()
     render_run_section(workspace_snapshot)
 

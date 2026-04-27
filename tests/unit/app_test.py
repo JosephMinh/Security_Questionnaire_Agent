@@ -134,8 +134,18 @@ class AppRunSectionTest(unittest.TestCase):
         self.assertEqual(len(at.metric), 1)
         self.assertEqual(at.metric[0].label, "Total Questions")
         self.assertEqual(str(at.metric[0].value), "3")
+        self.assertTrue(
+            any(
+                "Single curated workspace demo" in markdown.value
+                for markdown in at.markdown
+            )
+        )
         self.assertIn(
             "Completed 0 of 3 questions.",
+            [caption.value for caption in at.caption],
+        )
+        self.assertIn(
+            "Recovery-only controls for rebuilding the local index or resetting the curated demo workspace.",
             [caption.value for caption in at.caption],
         )
         self.assertIn(
