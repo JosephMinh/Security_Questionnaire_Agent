@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -1050,6 +1051,25 @@ def answered_questionnaire_output_path(output_dir: Path | None = None) -> Path:
     """Return the canonical workbook export path for one completed run."""
     base_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
     return base_output_dir / ANSWERED_QUESTIONNAIRE_FILE_NAME
+
+
+def review_summary_output_path(output_dir: Path | None = None) -> Path:
+    """Return the canonical review-summary markdown path for one completed run."""
+    base_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
+    return base_output_dir / REVIEW_SUMMARY_FILE_NAME
+
+
+def completed_run_timestamp(timestamp: str | None = None) -> str:
+    """Return one canonical UTC completion timestamp for export artifacts."""
+    if timestamp is not None:
+        normalized_timestamp = timestamp.strip()
+        if not normalized_timestamp:
+            raise ValueError("timestamp must be a non-empty string when provided.")
+        return normalized_timestamp
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
 
 
 def current_workspace_hash(manifest_path: Path | None = None) -> str:
@@ -2740,6 +2760,114 @@ def write_answered_questionnaire(
     return output_path
 
 
+def review_rows_in_priority_order(
+    questionnaire: RuntimeQuestionnaire,
+) -> list[dict[str, object]]:
+    """Return only review-bound rows in the same stable order used by reviewer queues."""
+    return sorted(
+        [
+            row
+            for row in questionnaire.rows
+            if str(row["status"]) == STATUS_NEEDS_REVIEW
+        ],
+        key=review_priority_sort_key,
+    )
+
+
+def final_index_action_for_questionnaire(questionnaire: RuntimeQuestionnaire) -> str:
+    """Return the final non-empty index action recorded across the completed run rows."""
+    index_actions = [
+        str(row["index_action"]).strip()
+        for row in questionnaire.rows
+        if str(row["index_action"]).strip()
+    ]
+    if not index_actions:
+        raise ValueError("questionnaire rows do not include a final index_action.")
+    return index_actions[-1]
+
+
+def build_review_summary_markdown(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    completed_at: str | None = None,
+    workspace_hash: str | None = None,
+    index_action: str | None = None,
+) -> str:
+    """Render the standalone markdown summary for one completed questionnaire run."""
+    completed_timestamp = completed_run_timestamp(completed_at)
+    resolved_workspace_hash = (
+        current_workspace_hash() if workspace_hash is None else workspace_hash.strip()
+    )
+    if not resolved_workspace_hash:
+        raise ValueError("workspace_hash must be a non-empty string.")
+    resolved_index_action = (
+        final_index_action_for_questionnaire(questionnaire)
+        if index_action is None
+        else index_action.strip()
+    )
+    if not resolved_index_action:
+        raise ValueError("index_action must be a non-empty string.")
+
+    total_questions = len(questionnaire.rows)
+    ready_count = sum(
+        1
+        for row in questionnaire.rows
+        if str(row["status"]) == STATUS_READY_FOR_REVIEW
+    )
+    review_rows = review_rows_in_priority_order(questionnaire)
+    lines = [
+        f"Completed Run: {completed_timestamp}",
+        f"Workspace Hash: {resolved_workspace_hash}",
+        f"Index State: {resolved_index_action}",
+        "",
+        "# Review Summary",
+        "",
+        f"- Total Questions: {total_questions}",
+        f"- Ready for Review: {ready_count}",
+        f"- Needs Review: {len(review_rows)}",
+        "",
+        "## Needs Review Queue",
+    ]
+    if not review_rows:
+        lines.append("- None. All questions are ready for review.")
+    else:
+        for row in review_rows:
+            reviewer_note = row.get("reviewer_note")
+            note_text = (
+                reviewer_note.strip()
+                if isinstance(reviewer_note, str)
+                else FALLBACK_REVIEWER_NOTE
+            )
+            lines.append(
+                f"- {row['question_id']}: {note_text or FALLBACK_REVIEWER_NOTE}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_review_summary(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    output_dir: Path | None = None,
+    completed_at: str | None = None,
+    workspace_hash: str | None = None,
+    index_action: str | None = None,
+) -> Path:
+    """Write the standalone markdown review summary to the canonical outputs directory."""
+    output_path = review_summary_output_path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        build_review_summary_markdown(
+            questionnaire,
+            completed_at=completed_at,
+            workspace_hash=workspace_hash,
+            index_action=index_action,
+        ),
+        encoding="utf-8",
+    )
+    return output_path
+
+
 def prepare_questionnaire_run(
     questionnaire: RuntimeQuestionnaire,
 ) -> RuntimeQuestionnaire:
@@ -3019,6 +3147,7 @@ __all__ = [
     "CHUNK_OVERLAP_CHARS",
     "CHUNK_SIZE_CHARS",
     "COLLECTION_NAME",
+    "completed_run_timestamp",
     "CONFIDENCE_BAND_HIGH",
     "CONFIDENCE_BAND_LOW",
     "CONFIDENCE_BAND_MEDIUM",
@@ -3133,6 +3262,7 @@ __all__ = [
     "WORKSPACE_FIXTURES_DIR",
     "build_answer_prompt_messages",
     "build_answered_questionnaire_workbook",
+    "build_review_summary_markdown",
     "build_answer_user_prompt",
     "build_citation_display_label",
     "build_curated_evidence_chunks",
@@ -3146,6 +3276,7 @@ __all__ = [
     "delete_existing_chroma_collection",
     "ensure_curated_evidence_index",
     "evaluate_chroma_reuse",
+    "final_index_action_for_questionnaire",
     "format_retrieved_chunk_for_prompt",
     "generate_answer_payload",
     "generate_answer_result",
@@ -3172,6 +3303,8 @@ __all__ = [
     "retrieve_evidence_chunks_for_row",
     "resolve_validated_citations",
     "review_priority_sort_key",
+    "review_rows_in_priority_order",
+    "review_summary_output_path",
     "review_status_for_score",
     "run_questionnaire_answer_pipeline",
     "RuntimeQuestionnaire",
@@ -3184,4 +3317,5 @@ __all__ = [
     "verification_command_by_name",
     "verification_sequence_shell_commands",
     "write_answered_questionnaire",
+    "write_review_summary",
 ]
