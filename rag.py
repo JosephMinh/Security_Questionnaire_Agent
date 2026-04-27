@@ -7,6 +7,8 @@ from pathlib import Path
 from shlex import join as shell_join
 from typing import Final, Mapping, Sequence
 
+from openpyxl import load_workbook
+
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parent
 
 APP_TITLE: Final[str] = "AI Security Questionnaire Copilot"
@@ -238,6 +240,46 @@ LOG_OPTIONAL_FIELDS: Final[tuple[str, ...]] = (
     "artifact_path",
     "reason",
 )
+
+
+@dataclass
+class RuntimeQuestionnaire:
+    """In-memory questionnaire rows plus the visible export-column contract."""
+
+    workbook_path: Path
+    visible_columns: tuple[str, ...]
+    rows: list[dict[str, object]]
+
+    def question_ids(self) -> tuple[str, ...]:
+        """Return the loaded question identifiers in workbook order."""
+        return tuple(str(row["question_id"]) for row in self.rows)
+
+    def visible_rows(self) -> list[dict[str, object]]:
+        """Return only the workbook/export-facing fields in canonical order."""
+        return [
+            {column_name: row[column_name] for column_name in self.visible_columns}
+            for row in self.rows
+        ]
+
+    def to_dataframe(self) -> object:
+        """Materialize the questionnaire rows as a dataframe with visible columns first."""
+        try:
+            import pandas as pd
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "pandas is required to build the runtime dataframe. Install the project "
+                "requirements with `pip install -r requirements.txt` before calling "
+                "`RuntimeQuestionnaire.to_dataframe()`."
+            ) from exc
+        internal_columns = [
+            column_name
+            for column_name in self.rows[0].keys()
+            if column_name not in self.visible_columns
+        ]
+        return pd.DataFrame(
+            self.rows,
+            columns=(*self.visible_columns, *internal_columns),
+        )
 
 
 @dataclass(frozen=True)
@@ -634,6 +676,154 @@ def make_result_row_defaults() -> dict[str, object]:
     }
 
 
+def runtime_questionnaire_path() -> Path:
+    """Return the curated runtime questionnaire path inside the workspace."""
+    return RUNTIME_QUESTIONNAIRES_DIR / QUESTIONNAIRE_FILE_NAME
+
+
+def _normalize_workbook_text_cell(value: object) -> str:
+    """Convert a workbook cell value into the canonical in-memory text form."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_evidence_display_value(value: str) -> list[str]:
+    """Split the friendly workbook evidence cell into individual labels."""
+    return [label for label in value.split("; ") if label]
+
+
+def _build_runtime_question_row(
+    *,
+    question_id: str,
+    category: str,
+    question: str,
+    visible_values: Mapping[str, str],
+) -> dict[str, object]:
+    """Assemble one canonical row with both visible and internal-only fields."""
+    answer_value = visible_values["Answer"]
+    evidence_value = visible_values["Evidence"]
+    confidence_value = visible_values["Confidence"]
+    status_value = visible_values["Status"]
+    reviewer_notes_value = visible_values["Reviewer Notes"]
+
+    row = {
+        "Question ID": question_id,
+        "Category": category,
+        "Question": question,
+        "Answer": answer_value,
+        "Evidence": evidence_value,
+        "Confidence": confidence_value,
+        "Status": status_value,
+        "Reviewer Notes": reviewer_notes_value,
+        "question_id": question_id,
+        "category": category,
+        "question": question,
+        **make_result_row_defaults(),
+    }
+    row["answer"] = answer_value
+    row["confidence_band"] = confidence_value
+    row["status"] = status_value
+    row["reviewer_note"] = reviewer_notes_value
+    row["evidence_labels"] = _parse_evidence_display_value(evidence_value)
+    return row
+
+
+def load_runtime_questionnaire(
+    workbook_path: Path | None = None,
+) -> RuntimeQuestionnaire:
+    """Load the curated runtime workbook and add planned output columns in memory."""
+    path = workbook_path or runtime_questionnaire_path()
+    if not path.exists():
+        raise FileNotFoundError(
+            "Runtime questionnaire workbook is missing at "
+            f"{path}. Run `python generate_demo_data.py` to restore the curated demo "
+            "workspace before starting the pipeline."
+        )
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if QUESTION_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError(
+                f"Runtime questionnaire workbook {path} is missing the "
+                f"`{QUESTION_SHEET_NAME}` sheet."
+            )
+
+        worksheet = workbook[QUESTION_SHEET_NAME]
+        row_iter = worksheet.iter_rows(values_only=True)
+        try:
+            header_row = next(row_iter)
+        except StopIteration as exc:
+            raise ValueError(f"Runtime questionnaire workbook {path} is empty.") from exc
+
+        header_values = [_normalize_workbook_text_cell(value) for value in header_row]
+        if not any(header_values):
+            raise ValueError(f"Runtime questionnaire workbook {path} is empty.")
+
+        header_indexes = {
+            column_name: index
+            for index, column_name in enumerate(header_values)
+            if column_name
+        }
+        missing_seed_columns = [
+            column_name
+            for column_name in SEED_QUESTION_COLUMNS
+            if column_name not in header_indexes
+        ]
+        if missing_seed_columns:
+            raise ValueError(
+                "Runtime questionnaire workbook is missing required seed columns: "
+                f"{', '.join(missing_seed_columns)}."
+            )
+
+        loaded_rows: list[dict[str, object]] = []
+        for row_number, row_values in enumerate(row_iter, start=2):
+            if not any(value is not None and str(value).strip() for value in row_values):
+                continue
+
+            normalized_values = [
+                _normalize_workbook_text_cell(value) for value in row_values
+            ]
+            question_id = normalized_values[header_indexes["Question ID"]]
+            category = normalized_values[header_indexes["Category"]]
+            question = normalized_values[header_indexes["Question"]]
+            if not question_id or not category or not question:
+                raise ValueError(
+                    "Runtime questionnaire workbook has a row with missing required "
+                    f"seed values at Excel row {row_number}."
+                )
+
+            visible_values = {
+                column_name: (
+                    normalized_values[header_indexes[column_name]]
+                    if column_name in header_indexes
+                    else ""
+                )
+                for column_name in VISIBLE_OUTPUT_COLUMNS
+            }
+            loaded_rows.append(
+                _build_runtime_question_row(
+                    question_id=question_id,
+                    category=category,
+                    question=question,
+                    visible_values=visible_values,
+                )
+            )
+
+        if not loaded_rows:
+            raise ValueError(
+                f"Runtime questionnaire workbook {path} does not contain any question rows."
+            )
+    finally:
+        workbook.close()
+
+    return RuntimeQuestionnaire(
+        workbook_path=path,
+        visible_columns=VISIBLE_EXPORT_COLUMNS,
+        rows=loaded_rows,
+    )
+
+
 def review_priority_sort_key(row_like: Mapping[str, object]) -> tuple[float, int]:
     """Sort review rows by ascending confidence and then questionnaire order."""
     question_id = str(row_like["question_id"])
@@ -772,9 +962,12 @@ __all__ = [
     "build_citation_display_label",
     "build_evidence_display_value",
     "confidence_band_for_score",
+    "load_runtime_questionnaire",
     "make_result_row_defaults",
     "question_order_index",
     "review_priority_sort_key",
+    "RuntimeQuestionnaire",
+    "runtime_questionnaire_path",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
 ]
