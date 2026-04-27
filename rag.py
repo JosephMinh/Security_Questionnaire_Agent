@@ -922,6 +922,16 @@ def load_curated_pdf_evidence_documents(
     return tuple(page_documents)
 
 
+def load_curated_evidence_documents(
+    evidence_dir: Path | None = None,
+) -> tuple[EvidenceDocument, ...]:
+    """Load the full curated evidence pack into one stable document sequence."""
+    return (
+        *load_curated_text_evidence_documents(evidence_dir),
+        *load_curated_pdf_evidence_documents(evidence_dir),
+    )
+
+
 def normalize_evidence_text(text: str) -> str:
     """Normalize text deterministically while preserving headings and structure."""
     normalized_line_endings = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -1090,6 +1100,70 @@ def chunk_evidence_documents(
                 )
             )
     return tuple(chunked_documents)
+
+
+def build_curated_evidence_chunks(
+    evidence_dir: Path | None = None,
+) -> tuple[EvidenceChunk, ...]:
+    """Load, normalize, and chunk the curated evidence pack."""
+    documents = load_curated_evidence_documents(evidence_dir)
+    if not documents:
+        raise ValueError("The curated evidence pack did not produce any loadable documents.")
+    return chunk_evidence_documents(normalize_evidence_documents(documents))
+
+
+def _chroma_metadata_for_chunk(chunk: EvidenceChunk) -> dict[str, str | int]:
+    """Return storage-safe metadata for one chunk by dropping null Chroma fields."""
+    return {
+        key: value
+        for key, value in chunk.metadata().items()
+        if value is not None
+    }
+
+
+def persist_evidence_chunks(
+    collection_handle: ChromaCollectionHandle,
+    chunks: Sequence[EvidenceChunk],
+) -> tuple[EvidenceChunk, ...]:
+    """Upsert one deterministic chunk set into the persistent collection."""
+    finalized_chunks = tuple(chunks)
+    if not finalized_chunks:
+        raise ValueError("At least one evidence chunk is required for persistence.")
+
+    chunk_ids = [chunk.chunk_id for chunk in finalized_chunks]
+    if any(chunk_id is None for chunk_id in chunk_ids):
+        raise ValueError("All evidence chunks must have stable chunk IDs before persistence.")
+
+    resolved_chunk_ids = [str(chunk_id) for chunk_id in chunk_ids]
+    if len(set(resolved_chunk_ids)) != len(resolved_chunk_ids):
+        raise ValueError("Evidence chunk IDs must be unique before persistence.")
+
+    existing_collection_ids = set(collection_handle.collection.get()["ids"])
+    stale_collection_ids = sorted(existing_collection_ids.difference(resolved_chunk_ids))
+    if stale_collection_ids:
+        collection_handle.collection.delete(ids=stale_collection_ids)
+
+    collection_handle.collection.upsert(
+        ids=resolved_chunk_ids,
+        documents=[chunk.text for chunk in finalized_chunks],
+        metadatas=[_chroma_metadata_for_chunk(chunk) for chunk in finalized_chunks],
+    )
+    return finalized_chunks
+
+
+def persist_curated_evidence_chunks(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
+) -> tuple[EvidenceChunk, ...]:
+    """Persist the canonical curated chunk set into the stable Chroma collection."""
+    collection_handle = get_or_create_chroma_collection(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    chunks = build_curated_evidence_chunks(evidence_dir)
+    return persist_evidence_chunks(collection_handle, chunks)
 
 
 def _parse_evidence_display_value(value: str) -> list[str]:
@@ -1373,6 +1447,7 @@ __all__ = [
     "WORKSPACE_HASH_DIRECTORIES",
     "WORKSPACE_FIXTURES_DIR",
     "build_citation_display_label",
+    "build_curated_evidence_chunks",
     "build_evidence_display_value",
     "chroma_persist_directory",
     "chunk_evidence_document",
@@ -1381,6 +1456,7 @@ __all__ = [
     "get_or_create_chroma_collection",
     "get_or_create_demo_chroma_collection",
     "load_curated_pdf_evidence_documents",
+    "load_curated_evidence_documents",
     "load_curated_text_evidence_documents",
     "load_pdf_evidence_pages",
     "load_runtime_questionnaire",
@@ -1389,6 +1465,8 @@ __all__ = [
     "normalize_evidence_document",
     "normalize_evidence_documents",
     "normalize_evidence_text",
+    "persist_curated_evidence_chunks",
+    "persist_evidence_chunks",
     "question_order_index",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
