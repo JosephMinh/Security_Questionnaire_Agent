@@ -385,6 +385,22 @@ class ChromaReuseStatus:
 
 
 @dataclass(frozen=True)
+class ChromaIndexStatus:
+    """Report whether the demo index is ready after create/reuse/rebuild decisions."""
+
+    collection_name: str
+    persist_directory: Path
+    workspace_hash: str | None
+    stored_workspace_hash: str | None
+    stored_chunk_count: int | None
+    actual_chunk_count: int
+    index_action: str
+    ready: bool
+    reason: str
+    collection_handle: ChromaCollectionHandle | None = None
+
+
+@dataclass(frozen=True)
 class VerificationCommand:
     """One canonical verification command and the conditions around it."""
 
@@ -1043,6 +1059,24 @@ def evaluate_chroma_reuse(
     )
 
 
+def _index_status_from_reuse_status(
+    reuse_status: ChromaReuseStatus,
+) -> ChromaIndexStatus:
+    """Adapt one reuse-only status into the generic index decision surface."""
+    return ChromaIndexStatus(
+        collection_name=reuse_status.collection_name,
+        persist_directory=reuse_status.persist_directory,
+        workspace_hash=reuse_status.workspace_hash,
+        stored_workspace_hash=reuse_status.stored_workspace_hash,
+        stored_chunk_count=reuse_status.stored_chunk_count,
+        actual_chunk_count=reuse_status.actual_chunk_count,
+        index_action=reuse_status.index_action,
+        ready=reuse_status.reusable,
+        reason=reuse_status.reason,
+        collection_handle=reuse_status.collection_handle,
+    )
+
+
 def _normalize_workbook_text_cell(value: object) -> str:
     """Convert a workbook cell value into the canonical in-memory text form."""
     if value is None:
@@ -1382,6 +1416,161 @@ def persist_curated_evidence_chunks(
     return persisted_chunks
 
 
+def _persisted_index_status(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    index_action: str,
+    reason: str,
+) -> ChromaIndexStatus:
+    """Persist the curated index and return the resulting ready status."""
+    workspace_hash = current_workspace_hash(manifest_path)
+    persisted_chunks = persist_curated_evidence_chunks(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        evidence_dir=evidence_dir,
+        manifest_path=manifest_path,
+    )
+    collection_handle = get_existing_chroma_collection(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    if collection_handle is None:
+        raise RuntimeError(
+            f"Persistent Chroma collection {collection_name!r} was not available after "
+            "persisting the curated evidence chunks."
+        )
+
+    chunk_count = len(persisted_chunks)
+    return ChromaIndexStatus(
+        collection_name=collection_handle.collection_name,
+        persist_directory=collection_handle.persist_directory,
+        workspace_hash=workspace_hash,
+        stored_workspace_hash=workspace_hash,
+        stored_chunk_count=chunk_count,
+        actual_chunk_count=chunk_count,
+        index_action=index_action,
+        ready=True,
+        reason=reason,
+        collection_handle=collection_handle,
+    )
+
+
+def create_curated_evidence_index(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
+    manifest_path: Path | None = None,
+) -> ChromaIndexStatus:
+    """Create the canonical demo index when no reusable collection exists yet."""
+    return _persisted_index_status(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        evidence_dir=evidence_dir,
+        manifest_path=manifest_path,
+        index_action=INDEX_ACTION_CREATED,
+        reason="created",
+    )
+
+
+def delete_existing_chroma_collection(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+) -> bool:
+    """Delete one existing persistent Chroma collection when it is present."""
+    collection_handle = get_existing_chroma_collection(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    if collection_handle is None:
+        return False
+
+    collection_handle.client.delete_collection(name=collection_handle.collection_name)
+    return True
+
+
+def rebuild_curated_evidence_index(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    reason: str = "workspace_hash_changed",
+) -> ChromaIndexStatus:
+    """Delete and recreate the canonical demo index for the current workspace."""
+    delete_existing_chroma_collection(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    return _persisted_index_status(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        evidence_dir=evidence_dir,
+        manifest_path=manifest_path,
+        index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
+        reason=reason,
+    )
+
+
+def ensure_curated_evidence_index(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    force_rebuild: bool = False,
+) -> ChromaIndexStatus:
+    """Create, reuse, or rebuild the canonical demo index as needed."""
+    reuse_status = evaluate_chroma_reuse(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        manifest_path=manifest_path,
+    )
+    if force_rebuild:
+        if reuse_status.reason == "manifest_unavailable":
+            return _index_status_from_reuse_status(reuse_status)
+        if reuse_status.reason == "collection_missing":
+            return create_curated_evidence_index(
+                collection_name=collection_name,
+                persist_directory=persist_directory,
+                evidence_dir=evidence_dir,
+                manifest_path=manifest_path,
+            )
+        return rebuild_curated_evidence_index(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            evidence_dir=evidence_dir,
+            manifest_path=manifest_path,
+            reason="force_rebuild",
+        )
+
+    if reuse_status.reusable:
+        return _index_status_from_reuse_status(reuse_status)
+
+    if reuse_status.reason == "collection_missing":
+        return create_curated_evidence_index(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            evidence_dir=evidence_dir,
+            manifest_path=manifest_path,
+        )
+
+    if reuse_status.reason == "workspace_hash_mismatch":
+        return rebuild_curated_evidence_index(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            evidence_dir=evidence_dir,
+            manifest_path=manifest_path,
+            reason="workspace_hash_changed",
+        )
+
+    return _index_status_from_reuse_status(reuse_status)
+
+
 def _parse_evidence_display_value(value: str) -> list[str]:
     """Split the friendly workbook evidence cell into individual labels."""
     return [label for label in value.split("; ") if label]
@@ -1556,6 +1745,7 @@ __all__ = [
     "CANONICAL_VERIFICATION_COMMANDS",
     "CHROMA_DIR",
     "ChromaCollectionHandle",
+    "ChromaIndexStatus",
     "ChromaReuseStatus",
     "CHUNK_OVERLAP_CHARS",
     "CHUNK_SIZE_CHARS",
@@ -1671,6 +1861,9 @@ __all__ = [
     "chunk_evidence_documents",
     "confidence_band_for_score",
     "current_workspace_hash",
+    "create_curated_evidence_index",
+    "delete_existing_chroma_collection",
+    "ensure_curated_evidence_index",
     "evaluate_chroma_reuse",
     "get_existing_chroma_collection",
     "get_or_create_chroma_collection",
@@ -1688,6 +1881,7 @@ __all__ = [
     "persist_curated_evidence_chunks",
     "persist_evidence_chunks",
     "question_order_index",
+    "rebuild_curated_evidence_index",
     "record_indexed_workspace_state",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
