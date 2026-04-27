@@ -291,7 +291,7 @@ def _scenario_pipeline_and_exports(
     index_status: rag.ChromaIndexStatus,
     output_dir: Path,
 ) -> None:
-    """Exercise retry ceilings, no-retry fail-closed cases, ordering, and reviewer exports."""
+    """Exercise retry ceilings, canonical fail-closed outputs, ordering, and reviewer exports."""
 
     logger.emit(
         component="e2e",
