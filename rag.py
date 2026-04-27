@@ -9,7 +9,7 @@ from pathlib import Path
 from shlex import join as shell_join
 from typing import Any, Callable, Final, Mapping, Sequence
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parent
 
@@ -1025,6 +1025,12 @@ def runtime_evidence_directory() -> Path:
 def runtime_manifest_path() -> Path:
     """Return the current runtime workspace-manifest path."""
     return DATA_DIR / MANIFEST_FILE_NAME
+
+
+def answered_questionnaire_output_path(output_dir: Path | None = None) -> Path:
+    """Return the canonical workbook export path for one completed run."""
+    base_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
+    return base_output_dir / ANSWERED_QUESTIONNAIRE_FILE_NAME
 
 
 def current_workspace_hash(manifest_path: Path | None = None) -> str:
@@ -2606,6 +2612,70 @@ def _parse_evidence_display_value(value: str) -> list[str]:
     return [label for label in value.split("; ") if label]
 
 
+def _visible_export_cell_value(
+    row_like: Mapping[str, object],
+    column_name: str,
+) -> str:
+    """Render one visible export cell from the canonical internal row contract."""
+    def string_value(value: object) -> str:
+        return "" if value is None else str(value)
+
+    if column_name == "Question ID":
+        return string_value(row_like["question_id"])
+    if column_name == "Category":
+        return string_value(row_like["category"])
+    if column_name == "Question":
+        return string_value(row_like["question"])
+    if column_name == "Answer":
+        return string_value(row_like["answer"])
+    if column_name == "Evidence":
+        evidence_labels = row_like.get("evidence_labels", ())
+        if isinstance(evidence_labels, (list, tuple)):
+            return build_evidence_display_value(
+                string_value(label) for label in evidence_labels if string_value(label)
+            )
+        return string_value(row_like.get("Evidence", ""))
+    if column_name == "Confidence":
+        return string_value(row_like["confidence_band"])
+    if column_name == "Status":
+        return string_value(row_like["status"])
+    if column_name == "Reviewer Notes":
+        return string_value(row_like["reviewer_note"])
+    raise KeyError(f"Unsupported visible export column {column_name!r}.")
+
+
+def build_answered_questionnaire_workbook(
+    questionnaire: RuntimeQuestionnaire,
+) -> Workbook:
+    """Create a fresh answered-questionnaire workbook from the visible row contract."""
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = QUESTION_SHEET_NAME
+    worksheet.append(list(VISIBLE_EXPORT_COLUMNS))
+    for row in questionnaire.rows:
+        worksheet.append([
+            _visible_export_cell_value(row, column_name)
+            for column_name in VISIBLE_EXPORT_COLUMNS
+        ])
+    return workbook
+
+
+def write_answered_questionnaire(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    output_dir: Path | None = None,
+) -> Path:
+    """Write the answered-questionnaire workbook to the canonical outputs directory."""
+    output_path = answered_questionnaire_output_path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = build_answered_questionnaire_workbook(questionnaire)
+    try:
+        workbook.save(output_path)
+    finally:
+        workbook.close()
+    return output_path
+
+
 def prepare_questionnaire_run(
     questionnaire: RuntimeQuestionnaire,
 ) -> RuntimeQuestionnaire:
@@ -2871,6 +2941,7 @@ __all__ = [
     "ANSWER_TYPE_UNSUPPORTED",
     "ANSWER_TYPES",
     "ANSWERED_QUESTIONNAIRE_FILE_NAME",
+    "answered_questionnaire_output_path",
     "APP_SUBTITLE",
     "APP_TITLE",
     "AnswerConfidenceResult",
@@ -2997,6 +3068,7 @@ __all__ = [
     "WORKSPACE_HASH_DIRECTORIES",
     "WORKSPACE_FIXTURES_DIR",
     "build_answer_prompt_messages",
+    "build_answered_questionnaire_workbook",
     "build_answer_user_prompt",
     "build_citation_display_label",
     "build_curated_evidence_chunks",
@@ -3047,4 +3119,5 @@ __all__ = [
     "validate_answer_payload",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
+    "write_answered_questionnaire",
 ]
