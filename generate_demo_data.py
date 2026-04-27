@@ -5,17 +5,28 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import shutil
 
+from openpyxl import load_workbook
+
 from rag import (
     CHROMA_DIR,
     DATA_DIR,
+    EXPECTED_EVIDENCE_FILE_NAMES,
+    EXPECTED_QUESTION_IDS,
     MANIFEST_FILE_NAME,
     OUTPUTS_DIR,
+    QUESTIONNAIRE_FILE_NAME,
+    QUESTION_SHEET_NAME,
     RUNTIME_DIRECTORIES,
+    RUNTIME_EVIDENCE_DIR,
+    RUNTIME_QUESTIONNAIRES_DIR,
+    SEED_QUESTION_COLUMNS,
     SEED_TO_RUNTIME_PATHS,
+    SOC2_SUMMARY_FILE_NAME,
     WORKSPACE_HASH_DIRECTORIES,
 )
 
@@ -42,6 +53,35 @@ class ManifestEntry:
     relative_path: str
     sha256: str
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    """One actionable runtime workspace validation problem."""
+
+    path: Path
+    message: str
+    recovery_hint: str
+
+    def render(self) -> str:
+        """Return one user-facing validation line."""
+        return f"- {self.path}: {self.message} Recovery: {self.recovery_hint}"
+
+
+class WorkspaceValidationError(RuntimeError):
+    """Raised when the curated runtime workspace no longer matches the demo contract."""
+
+    def __init__(self, issues: tuple[ValidationIssue, ...]):
+        self.issues = issues
+        super().__init__("\n".join(issue.render() for issue in issues))
+
+
+PDF_EXPECTED_TEXT_SNIPPETS = (
+    "SOC 2 Type II",
+    "independent third-party audit firm",
+    "Audit period:",
+    "relevant security controls",
+)
 
 
 def ensure_runtime_directories() -> tuple[Path, ...]:
@@ -129,6 +169,280 @@ def manifest_path() -> Path:
     return DATA_DIR / MANIFEST_FILE_NAME
 
 
+def questionnaire_path() -> Path:
+    """Return the curated runtime questionnaire path."""
+    return RUNTIME_QUESTIONNAIRES_DIR / QUESTIONNAIRE_FILE_NAME
+
+
+def expected_runtime_evidence_paths() -> tuple[Path, ...]:
+    """Return the curated runtime evidence paths in canonical order."""
+    return tuple(RUNTIME_EVIDENCE_DIR / file_name for file_name in EXPECTED_EVIDENCE_FILE_NAMES)
+
+
+def validate_questionnaire_workbook() -> tuple[ValidationIssue, ...]:
+    """Validate the runtime questionnaire workbook against the fixed demo contract."""
+    path = questionnaire_path()
+    recovery_hint = (
+        "Rerun `python generate_demo_data.py` to restore the curated workbook from seed data."
+    )
+    if not path.exists():
+        return (
+            ValidationIssue(
+                path=path,
+                message="The curated runtime questionnaire workbook is missing.",
+                recovery_hint=recovery_hint,
+            ),
+        )
+
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except Exception as exc:  # pragma: no cover - defensive contract handling
+        return (
+            ValidationIssue(
+                path=path,
+                message=f"The questionnaire workbook could not be opened: {exc}",
+                recovery_hint=recovery_hint,
+            ),
+        )
+
+    issues: list[ValidationIssue] = []
+    if workbook.sheetnames != [QUESTION_SHEET_NAME]:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                message=(
+                    f"Expected exactly one worksheet named `{QUESTION_SHEET_NAME}`, "
+                    f"found {workbook.sheetnames}."
+                ),
+                recovery_hint=recovery_hint,
+            )
+        )
+        return tuple(issues)
+
+    worksheet = workbook[QUESTION_SHEET_NAME]
+    rows = list(worksheet.iter_rows(values_only=True))
+    if not rows:
+        return (
+            ValidationIssue(
+                path=path,
+                message="The questionnaire workbook is empty.",
+                recovery_hint=recovery_hint,
+            ),
+        )
+
+    observed_columns = tuple("" if cell is None else str(cell) for cell in rows[0])
+    if observed_columns != SEED_QUESTION_COLUMNS:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                message=(
+                    f"Expected source columns {SEED_QUESTION_COLUMNS}, "
+                    f"found {observed_columns}."
+                ),
+                recovery_hint=(
+                    "Replace the workbook with the curated seed copy or rerun "
+                    "`python generate_demo_data.py`."
+                ),
+            )
+        )
+
+    observed_question_ids: list[str] = []
+    seen_question_ids: set[str] = set()
+    for row_index, row in enumerate(rows[1:], start=2):
+        if len(row) < len(SEED_QUESTION_COLUMNS):
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=f"Row {row_index} does not contain all required source columns.",
+                    recovery_hint=recovery_hint,
+                )
+            )
+            continue
+
+        question_id = "" if row[0] is None else str(row[0]).strip()
+        category = "" if row[1] is None else str(row[1]).strip()
+        question_text = "" if row[2] is None else str(row[2]).strip()
+
+        if not question_id or not category or not question_text:
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=(
+                        f"Row {row_index} must populate `Question ID`, `Category`, and `Question`."
+                    ),
+                    recovery_hint=recovery_hint,
+                )
+            )
+            continue
+
+        if question_id in seen_question_ids:
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=f"Question ID `{question_id}` is duplicated in the workbook.",
+                    recovery_hint=(
+                        "Restore the canonical workbook from seed data so each demo question "
+                        "appears exactly once."
+                    ),
+                )
+            )
+            continue
+
+        seen_question_ids.add(question_id)
+        observed_question_ids.append(question_id)
+
+    if observed_question_ids != list(EXPECTED_QUESTION_IDS):
+        issues.append(
+            ValidationIssue(
+                path=path,
+                message=(
+                    f"Expected question IDs in order {list(EXPECTED_QUESTION_IDS)}, "
+                    f"found {observed_question_ids}."
+                ),
+                recovery_hint=(
+                    "Rerun `python generate_demo_data.py` to restore the canonical 22-question "
+                    "demo workbook."
+                ),
+            )
+        )
+
+    return tuple(issues)
+
+
+def validate_soc2_summary_pdf(path: Path) -> tuple[ValidationIssue, ...]:
+    """Validate that the bundled SOC 2 PDF still looks like the intended text-based artifact."""
+    recovery_hint = (
+        "Regenerate the curated evidence workspace or replace the PDF with the bundled seed copy."
+    )
+    if not path.exists():
+        return (
+            ValidationIssue(
+                path=path,
+                message="The bundled SOC 2 summary PDF is missing.",
+                recovery_hint=recovery_hint,
+            ),
+        )
+
+    raw_bytes = path.read_bytes()
+    if not raw_bytes:
+        return (
+            ValidationIssue(
+                path=path,
+                message="The bundled SOC 2 summary PDF is empty.",
+                recovery_hint=recovery_hint,
+            ),
+        )
+    if not raw_bytes.startswith(b"%PDF-"):
+        return (
+            ValidationIssue(
+                path=path,
+                message="The bundled SOC 2 summary does not have a valid PDF header.",
+                recovery_hint=recovery_hint,
+            ),
+        )
+
+    visible_text = raw_bytes.decode("latin-1", errors="ignore")
+    missing_snippets = [
+        snippet for snippet in PDF_EXPECTED_TEXT_SNIPPETS if snippet not in visible_text
+    ]
+    issues: list[ValidationIssue] = []
+    if missing_snippets:
+        issues.append(
+            ValidationIssue(
+                path=path,
+                message=(
+                    "The bundled SOC 2 PDF is missing required visible text claims: "
+                    + ", ".join(missing_snippets)
+                ),
+                recovery_hint=recovery_hint,
+            )
+        )
+
+    if importlib.util.find_spec("pypdf") is not None:
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            extracted_text = "".join(page.extract_text() or "" for page in PdfReader(path).pages)
+        except Exception as exc:  # pragma: no cover - depends on optional runtime dependency
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=f"The bundled SOC 2 PDF could not be parsed by pypdf: {exc}",
+                    recovery_hint=recovery_hint,
+                )
+            )
+        else:
+            if not extracted_text.strip():
+                issues.append(
+                    ValidationIssue(
+                        path=path,
+                        message="The bundled SOC 2 PDF did not yield extractable text in pypdf.",
+                        recovery_hint=recovery_hint,
+                    )
+                )
+
+    return tuple(issues)
+
+
+def validate_runtime_evidence_files() -> tuple[ValidationIssue, ...]:
+    """Validate the curated runtime evidence file set against the fixed demo contract."""
+    issues: list[ValidationIssue] = []
+    recovery_hint = (
+        "Rerun `python generate_demo_data.py` to repopulate the curated evidence workspace."
+    )
+    existing_file_names = {
+        path.name for path in RUNTIME_EVIDENCE_DIR.iterdir() if path.is_file() and path.name != ".gitkeep"
+    }
+    expected_file_names = set(EXPECTED_EVIDENCE_FILE_NAMES)
+
+    missing_file_names = sorted(expected_file_names - existing_file_names)
+    unexpected_file_names = sorted(existing_file_names - expected_file_names)
+
+    for file_name in missing_file_names:
+        issues.append(
+            ValidationIssue(
+                path=RUNTIME_EVIDENCE_DIR / file_name,
+                message="The curated runtime evidence file is missing.",
+                recovery_hint=recovery_hint,
+            )
+        )
+    for file_name in unexpected_file_names:
+        issues.append(
+            ValidationIssue(
+                path=RUNTIME_EVIDENCE_DIR / file_name,
+                message="Unexpected runtime evidence file present outside the curated demo set.",
+                recovery_hint="Reset the demo workspace so only the bundled evidence files remain.",
+            )
+        )
+
+    for path in expected_runtime_evidence_paths():
+        if not path.exists():
+            continue
+        if path.stat().st_size == 0:
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message="The curated runtime evidence file is empty.",
+                    recovery_hint=recovery_hint,
+                )
+            )
+            continue
+        if path.name == SOC2_SUMMARY_FILE_NAME:
+            issues.extend(validate_soc2_summary_pdf(path))
+
+    return tuple(issues)
+
+
+def validate_runtime_workspace() -> None:
+    """Fail fast if the curated runtime workspace no longer matches the demo contract."""
+    issues = (
+        *validate_questionnaire_workbook(),
+        *validate_runtime_evidence_files(),
+    )
+    if issues:
+        raise WorkspaceValidationError(tuple(issues))
+
+
 def write_workspace_manifest() -> Path:
     """Write the current runtime workspace manifest with file-level hashes."""
     entries = build_manifest_entries()
@@ -176,6 +490,7 @@ def prepare_demo_workspace(*, reset_index: bool = False) -> tuple[WorkspaceCopyR
     clear_output_artifacts()
     if reset_index:
         reset_index_cache()
+    validate_runtime_workspace()
     write_workspace_manifest()
     return copied_assets
 
@@ -183,7 +498,13 @@ def prepare_demo_workspace(*, reset_index: bool = False) -> tuple[WorkspaceCopyR
 def main() -> int:
     """Run the setup path used by the UI's Load Demo Workspace action."""
     args = parse_args()
-    copied_assets = prepare_demo_workspace(reset_index=args.reset_index)
+    try:
+        copied_assets = prepare_demo_workspace(reset_index=args.reset_index)
+    except WorkspaceValidationError as exc:
+        print("Workspace validation failed.")
+        for issue in exc.issues:
+            print(issue.render())
+        return 1
     print("Prepared demo workspace.")
     print(f"Workspace manifest: {manifest_path()}")
     print(f"Index reset requested: {args.reset_index}")
@@ -202,6 +523,7 @@ __all__ = [
     "SEED_TO_RUNTIME_PATHS",
     "CleanupResult",
     "ManifestEntry",
+    "ValidationIssue",
     "WorkspaceCopyResult",
     "build_manifest_entries",
     "clear_directory_contents",
@@ -214,5 +536,8 @@ __all__ = [
     "parse_args",
     "prepare_demo_workspace",
     "reset_index_cache",
+    "validate_questionnaire_workbook",
+    "validate_runtime_evidence_files",
+    "validate_runtime_workspace",
     "write_workspace_manifest",
 ]
