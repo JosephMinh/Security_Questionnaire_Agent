@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 from shlex import join as shell_join
-from typing import Final, Mapping, Sequence
+from typing import Any, Final, Mapping, Sequence
 
 from openpyxl import load_workbook
 
@@ -355,6 +355,16 @@ class EvidenceChunk:
             "section": self.section,
             "page": self.page,
         }
+
+
+@dataclass(frozen=True)
+class ChromaCollectionHandle:
+    """One stable handle to the demo's persistent Chroma collection."""
+
+    collection_name: str
+    persist_directory: Path
+    client: Any
+    collection: Any
 
 
 @dataclass(frozen=True)
@@ -767,6 +777,59 @@ def runtime_questionnaire_path() -> Path:
 def runtime_evidence_directory() -> Path:
     """Return the curated runtime evidence directory inside the workspace."""
     return RUNTIME_EVIDENCE_DIR
+
+
+def chroma_persist_directory(persist_directory: Path | None = None) -> Path:
+    """Return the stable local persistence directory for the Chroma demo index."""
+    if persist_directory is None:
+        return CHROMA_DIR
+    return Path(persist_directory)
+
+
+def _import_chromadb() -> Any:
+    """Import chromadb lazily so non-indexing shells can still load rag helpers."""
+    try:
+        import chromadb
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "chromadb is required for the persistent demo index. "
+            "Install dependencies with `pip install -r requirements.txt`."
+        ) from exc
+    return chromadb
+
+
+def get_or_create_chroma_collection(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+) -> ChromaCollectionHandle:
+    """Create or reconnect to one persistent Chroma collection."""
+    normalized_collection_name = collection_name.strip()
+    if not normalized_collection_name:
+        raise ValueError("collection_name must be a non-empty string.")
+
+    persistence_path = chroma_persist_directory(persist_directory)
+    persistence_path.mkdir(parents=True, exist_ok=True)
+
+    chromadb = _import_chromadb()
+    client = chromadb.PersistentClient(path=str(persistence_path))
+    collection = client.get_or_create_collection(name=normalized_collection_name)
+    return ChromaCollectionHandle(
+        collection_name=normalized_collection_name,
+        persist_directory=persistence_path,
+        client=client,
+        collection=collection,
+    )
+
+
+def get_or_create_demo_chroma_collection(
+    persist_directory: Path | None = None,
+) -> ChromaCollectionHandle:
+    """Create or reconnect to the one canonical demo collection."""
+    return get_or_create_chroma_collection(
+        collection_name=COLLECTION_NAME,
+        persist_directory=persist_directory,
+    )
 
 
 def _normalize_workbook_text_cell(value: object) -> str:
@@ -1200,6 +1263,7 @@ __all__ = [
     "BACKUP_RECOVERY_POLICY_FILE_NAME",
     "CANONICAL_VERIFICATION_COMMANDS",
     "CHROMA_DIR",
+    "ChromaCollectionHandle",
     "CHUNK_OVERLAP_CHARS",
     "CHUNK_SIZE_CHARS",
     "COLLECTION_NAME",
@@ -1308,9 +1372,12 @@ __all__ = [
     "WORKSPACE_FIXTURES_DIR",
     "build_citation_display_label",
     "build_evidence_display_value",
+    "chroma_persist_directory",
     "chunk_evidence_document",
     "chunk_evidence_documents",
     "confidence_band_for_score",
+    "get_or_create_chroma_collection",
+    "get_or_create_demo_chroma_collection",
     "load_curated_pdf_evidence_documents",
     "load_curated_text_evidence_documents",
     "load_pdf_evidence_pages",
