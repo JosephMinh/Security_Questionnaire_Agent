@@ -25,7 +25,7 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 )
 
 
-SCRIPT_NAME: Final[str] = "run_blocked_recovery_paths"
+SCRIPT_NAME: Final[str] = "run_blocked_recovery_paths_test"
 LOG_FILE_NAME: Final[str] = f"{SCRIPT_NAME}.jsonl"
 SUITE_RUN_ID: Final[str] = "blocked-recovery-e2e"
 
