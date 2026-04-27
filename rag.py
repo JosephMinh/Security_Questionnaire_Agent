@@ -170,6 +170,13 @@ CHUNK_METADATA_DOC_TYPE_BY_SOURCE_FILE_NAME: Final[Mapping[str, str]] = {
     BACKUP_RECOVERY_POLICY_FILE_NAME: DOCUMENT_TYPE_POLICY,
     SOC2_SUMMARY_FILE_NAME: DOCUMENT_TYPE_PDF,
 }
+DISPLAY_LABEL_BY_SOURCE_FILE_NAME: Final[Mapping[str, str]] = {
+    ENCRYPTION_POLICY_FILE_NAME: "Encryption Policy",
+    ACCESS_CONTROL_POLICY_FILE_NAME: "Access Control Policy",
+    INCIDENT_RESPONSE_POLICY_FILE_NAME: "Incident Response Policy",
+    BACKUP_RECOVERY_POLICY_FILE_NAME: "Backup and Recovery Policy",
+    SOC2_SUMMARY_FILE_NAME: "SOC 2 Summary",
+}
 
 RUNTIME_DIRECTORIES: Final[tuple[Path, ...]] = (
     RUNTIME_QUESTIONNAIRES_DIR,
@@ -713,14 +720,22 @@ def build_evidence_display_value(display_labels: Sequence[str]) -> str:
     return "; ".join(label for label in display_labels if label)
 
 
+def _friendly_source_label(source_file_name: str) -> str:
+    """Return the stable human-facing label for one evidence source."""
+    return DISPLAY_LABEL_BY_SOURCE_FILE_NAME.get(
+        source_file_name,
+        source_file_name.replace("_", " ").rsplit(".", 1)[0],
+    )
+
+
 def build_citation_display_label(
     source_file_name: str,
     section: str | None = None,
     page: int | None = None,
 ) -> str:
     """Create the reviewer-facing label for one citation."""
-    base_label = source_file_name.replace("_", " ").rsplit(".", 1)[0]
-    if section:
+    base_label = _friendly_source_label(source_file_name)
+    if section and section != base_label:
         return f"{base_label} — {section}"
     if page is not None:
         return f"{base_label} — Page {page}"
@@ -924,6 +939,35 @@ def _chunk_metadata_doc_type_for_source(source_file_name: str) -> str:
         ) from exc
 
 
+def _markdown_heading_text(line: str) -> str | None:
+    """Return one markdown ATX heading text when the line is a heading."""
+    stripped_line = line.strip()
+    if not stripped_line.startswith("#"):
+        return None
+    heading_marks, separator, heading_text = stripped_line.partition(" ")
+    if not separator or set(heading_marks) != {"#"}:
+        return None
+    heading_text = heading_text.strip()
+    return heading_text or None
+
+
+def _section_label_for_chunk(document: EvidenceDocument, start_offset: int) -> str | None:
+    """Return the nearest section label or a stable fallback for one chunk start."""
+    if document.doc_type == DOCUMENT_TYPE_PDF:
+        return None
+
+    nearest_heading: str | None = None
+    line_start_offset = 0
+    for line in document.text.split("\n"):
+        if line_start_offset > start_offset:
+            break
+        heading_text = _markdown_heading_text(line)
+        if heading_text:
+            nearest_heading = heading_text
+        line_start_offset += len(line) + 1
+    return nearest_heading or _friendly_source_label(document.source_file_name)
+
+
 def chunk_evidence_document(
     document: EvidenceDocument,
     *,
@@ -946,6 +990,7 @@ def chunk_evidence_document(
             chunk_number=chunk_number,
             start_offset=start_offset,
             end_offset=end_offset,
+            section=_section_label_for_chunk(document, start_offset),
             page=document.page_number,
         )
         for chunk_number, (start_offset, end_offset) in enumerate(boundaries, start=1)
