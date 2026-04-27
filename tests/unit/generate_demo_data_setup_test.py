@@ -146,6 +146,8 @@ class GenerateDemoDataSetupTests(unittest.TestCase):
 
         unexpected_file = self.runtime_evidence_dir / "Unexpected.txt"
         unexpected_file.write_text("not part of the curated demo", encoding="utf-8")
+        unexpected_questionnaire = self.runtime_questionnaires_dir / "Unexpected.xlsx"
+        unexpected_questionnaire.write_text("unexpected workbook", encoding="utf-8")
         missing_file = self.runtime_evidence_dir / setup_script.EXPECTED_EVIDENCE_FILE_NAMES[1]
         missing_file.unlink()
 
@@ -154,6 +156,7 @@ class GenerateDemoDataSetupTests(unittest.TestCase):
 
         rendered_issues = "\n".join(issue.render() for issue in raised.exception.issues)
         self.assertIn("Unexpected runtime evidence file present", rendered_issues)
+        self.assertIn("Unexpected runtime questionnaire file present", rendered_issues)
         self.assertIn("curated runtime evidence file is missing", rendered_issues)
         self.assertIn("Rerun `python generate_demo_data.py`", rendered_issues)
 

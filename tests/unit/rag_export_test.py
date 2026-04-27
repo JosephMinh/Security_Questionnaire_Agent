@@ -435,6 +435,10 @@ class RagExportTest(unittest.TestCase):
                 previous_summary.read_text(encoding="utf-8"),
                 "previous good packet",
             )
+            self.assertEqual(
+                sorted(output_dir.parent.glob(".outputs-staging-run-004-*")),
+                [],
+            )
 
 
 if __name__ == "__main__":

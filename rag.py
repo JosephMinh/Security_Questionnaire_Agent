@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 from shlex import join as shell_join
+import shutil
 import tempfile
 from typing import Any, Callable, Final, Mapping, Sequence
 
@@ -3554,6 +3555,7 @@ def publish_export_packet(
     if not resolved_workspace_hash:
         raise ValueError("workspace_hash must be a non-empty string.")
 
+    staging_dir: Path | None = None
     try:
         emit_structured_log(
             component=LOG_COMPONENT_EXPORT,
@@ -3660,6 +3662,8 @@ def publish_export_packet(
         )
         return packet
     except Exception as error:
+        if staging_dir is not None and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
         emit_structured_log(
             component=LOG_COMPONENT_EXPORT,
             event="export_publish_failed",

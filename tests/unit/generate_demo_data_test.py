@@ -7,9 +7,10 @@ from contextlib import contextmanager, redirect_stdout
 import io
 import json
 from pathlib import Path
+import shutil
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import generate_demo_data as gdd
 
@@ -145,6 +146,28 @@ class GenerateDemoDataTest(unittest.TestCase):
                     f"Reset-index must preserve the runtime evidence copy: {evidence_path.name}",
                 )
 
+    def test_prepare_demo_workspace_removes_unexpected_runtime_files_before_copy(self):
+        """Setup reruns should self-heal unexpected runtime artifacts instead of failing validation."""
+        with self.isolated_workspace():
+            gdd.prepare_demo_workspace(reset_index=False)
+            unexpected_questionnaire = (
+                gdd.RUNTIME_QUESTIONNAIRES_DIR / "Unexpected_Workbook.xlsx"
+            )
+            unexpected_questionnaire.write_text("stale workbook", encoding="utf-8")
+            unexpected_evidence = gdd.RUNTIME_EVIDENCE_DIR / "Unexpected.txt"
+            unexpected_evidence.write_text("stale evidence", encoding="utf-8")
+            missing_evidence = gdd.expected_runtime_evidence_paths()[0]
+            missing_evidence.unlink()
+
+            copied_assets = gdd.prepare_demo_workspace(reset_index=False)
+
+            self.assertEqual(len(copied_assets), 6)
+            self.assertFalse(unexpected_questionnaire.exists())
+            self.assertFalse(unexpected_evidence.exists())
+            self.assertTrue(gdd.questionnaire_path().exists())
+            for evidence_path in gdd.expected_runtime_evidence_paths():
+                self.assertTrue(evidence_path.exists())
+
     def test_validate_runtime_workspace_reports_actionable_error_for_missing_questionnaire(self):
         """Broken curated workspaces should fail with a recovery-oriented validation error."""
         with self.isolated_workspace():
@@ -158,6 +181,44 @@ class GenerateDemoDataTest(unittest.TestCase):
             self.assertIn("missing", rendered_issues.lower())
             self.assertIn("Recovery:", rendered_issues)
             self.assertIn("generate_demo_data.py", rendered_issues)
+
+    def test_validate_runtime_workspace_reports_missing_evidence_directory_as_issues(self):
+        """Missing runtime evidence directories should produce actionable validation issues."""
+        with self.isolated_workspace():
+            gdd.prepare_demo_workspace(reset_index=False)
+            shutil.rmtree(gdd.RUNTIME_EVIDENCE_DIR)
+
+            with self.assertRaises(gdd.WorkspaceValidationError) as context:
+                gdd.validate_runtime_workspace()
+
+            rendered_issues = "\n".join(issue.render() for issue in context.exception.issues)
+            self.assertIn("curated runtime evidence file is missing", rendered_issues)
+            self.assertIn("Recovery:", rendered_issues)
+
+    def test_validate_questionnaire_workbook_closes_read_only_workbook_handle(self):
+        """Workbook validation should always close the openpyxl handle after inspection."""
+        with self.isolated_workspace():
+            gdd.ensure_runtime_directories()
+            gdd.questionnaire_path().write_text("placeholder", encoding="utf-8")
+            worksheet = MagicMock()
+            worksheet.iter_rows.return_value = iter(
+                [
+                    gdd.SEED_QUESTION_COLUMNS,
+                    *(
+                        (question_id, "Category", f"Question {question_id}")
+                        for question_id in gdd.EXPECTED_QUESTION_IDS
+                    ),
+                ]
+            )
+            workbook = MagicMock()
+            workbook.sheetnames = [gdd.QUESTION_SHEET_NAME]
+            workbook.__getitem__.return_value = worksheet
+
+            with patch.object(gdd, "load_workbook", return_value=workbook):
+                issues = gdd.validate_questionnaire_workbook()
+
+            self.assertEqual(issues, ())
+            workbook.close.assert_called_once_with()
 
     def test_main_reports_success_for_default_cli_flow(self):
         """The default CLI path should prepare the workspace and print summary lines."""

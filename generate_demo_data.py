@@ -116,6 +116,17 @@ def iter_runtime_files(root_directory: Path) -> tuple[Path, ...]:
     )
 
 
+def runtime_file_names(directory: Path) -> set[str]:
+    """Return the non-gitkeep file names currently present in one runtime directory."""
+    if not directory.exists():
+        return set()
+    return {
+        path.name
+        for path in directory.iterdir()
+        if path.is_file() and path.name != ".gitkeep"
+    }
+
+
 def clear_directory_contents(directory: Path) -> tuple[CleanupResult, ...]:
     """Remove runtime artifacts from one directory while preserving the directory itself."""
     removed_artifacts: list[CleanupResult] = []
@@ -139,6 +150,14 @@ def clear_output_artifacts() -> tuple[CleanupResult, ...]:
 def reset_index_cache() -> tuple[CleanupResult, ...]:
     """Clear only the local Chroma cache directory when explicitly requested."""
     return clear_directory_contents(CHROMA_DIR)
+
+
+def clear_runtime_workspace_artifacts() -> tuple[CleanupResult, ...]:
+    """Clear the runtime questionnaire and evidence directories before re-copying seed data."""
+    return (
+        *clear_directory_contents(RUNTIME_QUESTIONNAIRES_DIR),
+        *clear_directory_contents(RUNTIME_EVIDENCE_DIR),
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -186,126 +205,145 @@ def validate_questionnaire_workbook() -> tuple[ValidationIssue, ...]:
     recovery_hint = (
         "Rerun `python generate_demo_data.py` to restore the curated workbook from seed data."
     )
-    if not path.exists():
-        return (
-            ValidationIssue(
-                path=path,
-                message="The curated runtime questionnaire workbook is missing.",
-                recovery_hint=recovery_hint,
-            ),
-        )
-
-    try:
-        workbook = load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:  # pragma: no cover - defensive contract handling
-        return (
-            ValidationIssue(
-                path=path,
-                message=f"The questionnaire workbook could not be opened: {exc}",
-                recovery_hint=recovery_hint,
-            ),
-        )
-
     issues: list[ValidationIssue] = []
-    if workbook.sheetnames != [QUESTION_SHEET_NAME]:
+    existing_file_names = runtime_file_names(RUNTIME_QUESTIONNAIRES_DIR)
+    unexpected_file_names = sorted(existing_file_names - {QUESTIONNAIRE_FILE_NAME})
+    for file_name in unexpected_file_names:
+        issues.append(
+            ValidationIssue(
+                path=RUNTIME_QUESTIONNAIRES_DIR / file_name,
+                message="Unexpected runtime questionnaire file present outside the curated demo set.",
+                recovery_hint=(
+                    "Reset the demo workspace so only the bundled questionnaire workbook remains."
+                ),
+            )
+        )
+
+    if not path.exists():
         issues.append(
             ValidationIssue(
                 path=path,
-                message=(
-                    f"Expected exactly one worksheet named `{QUESTION_SHEET_NAME}`, "
-                    f"found {workbook.sheetnames}."
-                ),
+                message="The curated runtime questionnaire workbook is missing.",
                 recovery_hint=recovery_hint,
             )
         )
         return tuple(issues)
 
-    worksheet = workbook[QUESTION_SHEET_NAME]
-    rows = list(worksheet.iter_rows(values_only=True))
-    if not rows:
-        return (
-            ValidationIssue(
-                path=path,
-                message="The questionnaire workbook is empty.",
-                recovery_hint=recovery_hint,
-            ),
-        )
-
-    observed_columns = tuple("" if cell is None else str(cell) for cell in rows[0])
-    if observed_columns != SEED_QUESTION_COLUMNS:
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except Exception as exc:  # pragma: no cover - defensive contract handling
         issues.append(
             ValidationIssue(
                 path=path,
-                message=(
-                    f"Expected source columns {SEED_QUESTION_COLUMNS}, "
-                    f"found {observed_columns}."
-                ),
-                recovery_hint=(
-                    "Replace the workbook with the curated seed copy or rerun "
-                    "`python generate_demo_data.py`."
-                ),
+                message=f"The questionnaire workbook could not be opened: {exc}",
+                recovery_hint=recovery_hint,
             )
         )
+        return tuple(issues)
 
-    observed_question_ids: list[str] = []
-    seen_question_ids: set[str] = set()
-    for row_index, row in enumerate(rows[1:], start=2):
-        if len(row) < len(SEED_QUESTION_COLUMNS):
-            issues.append(
-                ValidationIssue(
-                    path=path,
-                    message=f"Row {row_index} does not contain all required source columns.",
-                    recovery_hint=recovery_hint,
-                )
-            )
-            continue
-
-        question_id = "" if row[0] is None else str(row[0]).strip()
-        category = "" if row[1] is None else str(row[1]).strip()
-        question_text = "" if row[2] is None else str(row[2]).strip()
-
-        if not question_id or not category or not question_text:
+    try:
+        if workbook.sheetnames != [QUESTION_SHEET_NAME]:
             issues.append(
                 ValidationIssue(
                     path=path,
                     message=(
-                        f"Row {row_index} must populate `Question ID`, `Category`, and `Question`."
+                        f"Expected exactly one worksheet named `{QUESTION_SHEET_NAME}`, "
+                        f"found {workbook.sheetnames}."
                     ),
                     recovery_hint=recovery_hint,
                 )
             )
-            continue
+            return tuple(issues)
 
-        if question_id in seen_question_ids:
+        worksheet = workbook[QUESTION_SHEET_NAME]
+        rows = list(worksheet.iter_rows(values_only=True))
+        if not rows:
             issues.append(
                 ValidationIssue(
                     path=path,
-                    message=f"Question ID `{question_id}` is duplicated in the workbook.",
+                    message="The questionnaire workbook is empty.",
+                    recovery_hint=recovery_hint,
+                )
+            )
+            return tuple(issues)
+
+        observed_columns = tuple("" if cell is None else str(cell) for cell in rows[0])
+        if observed_columns != SEED_QUESTION_COLUMNS:
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=(
+                        f"Expected source columns {SEED_QUESTION_COLUMNS}, "
+                        f"found {observed_columns}."
+                    ),
                     recovery_hint=(
-                        "Restore the canonical workbook from seed data so each demo question "
-                        "appears exactly once."
+                        "Replace the workbook with the curated seed copy or rerun "
+                        "`python generate_demo_data.py`."
                     ),
                 )
             )
-            continue
 
-        seen_question_ids.add(question_id)
-        observed_question_ids.append(question_id)
+        observed_question_ids: list[str] = []
+        seen_question_ids: set[str] = set()
+        for row_index, row in enumerate(rows[1:], start=2):
+            if len(row) < len(SEED_QUESTION_COLUMNS):
+                issues.append(
+                    ValidationIssue(
+                        path=path,
+                        message=f"Row {row_index} does not contain all required source columns.",
+                        recovery_hint=recovery_hint,
+                    )
+                )
+                continue
 
-    if observed_question_ids != list(EXPECTED_QUESTION_IDS):
-        issues.append(
-            ValidationIssue(
-                path=path,
-                message=(
-                    f"Expected question IDs in order {list(EXPECTED_QUESTION_IDS)}, "
-                    f"found {observed_question_ids}."
-                ),
-                recovery_hint=(
-                    "Rerun `python generate_demo_data.py` to restore the canonical 22-question "
-                    "demo workbook."
-                ),
+            question_id = "" if row[0] is None else str(row[0]).strip()
+            category = "" if row[1] is None else str(row[1]).strip()
+            question_text = "" if row[2] is None else str(row[2]).strip()
+
+            if not question_id or not category or not question_text:
+                issues.append(
+                    ValidationIssue(
+                        path=path,
+                        message=(
+                            f"Row {row_index} must populate `Question ID`, `Category`, and `Question`."
+                        ),
+                        recovery_hint=recovery_hint,
+                    )
+                )
+                continue
+
+            if question_id in seen_question_ids:
+                issues.append(
+                    ValidationIssue(
+                        path=path,
+                        message=f"Question ID `{question_id}` is duplicated in the workbook.",
+                        recovery_hint=(
+                            "Restore the canonical workbook from seed data so each demo question "
+                            "appears exactly once."
+                        ),
+                    )
+                )
+                continue
+
+            seen_question_ids.add(question_id)
+            observed_question_ids.append(question_id)
+
+        if observed_question_ids != list(EXPECTED_QUESTION_IDS):
+            issues.append(
+                ValidationIssue(
+                    path=path,
+                    message=(
+                        f"Expected question IDs in order {list(EXPECTED_QUESTION_IDS)}, "
+                        f"found {observed_question_ids}."
+                    ),
+                    recovery_hint=(
+                        "Rerun `python generate_demo_data.py` to restore the canonical 22-question "
+                        "demo workbook."
+                    ),
+                )
             )
-        )
+    finally:
+        workbook.close()
 
     return tuple(issues)
 
@@ -391,9 +429,7 @@ def validate_runtime_evidence_files() -> tuple[ValidationIssue, ...]:
     recovery_hint = (
         "Rerun `python generate_demo_data.py` to repopulate the curated evidence workspace."
     )
-    existing_file_names = {
-        path.name for path in RUNTIME_EVIDENCE_DIR.iterdir() if path.is_file() and path.name != ".gitkeep"
-    }
+    existing_file_names = runtime_file_names(RUNTIME_EVIDENCE_DIR)
     expected_file_names = set(EXPECTED_EVIDENCE_FILE_NAMES)
 
     missing_file_names = sorted(expected_file_names - existing_file_names)
@@ -487,6 +523,7 @@ def parse_args() -> argparse.Namespace:
 def prepare_demo_workspace(*, reset_index: bool = False) -> tuple[WorkspaceCopyResult, ...]:
     """Create the runtime workspace, clean it safely, and populate it with seed assets."""
     ensure_runtime_directories()
+    clear_runtime_workspace_artifacts()
     copied_assets = copy_seed_assets()
     clear_output_artifacts()
     if reset_index:
