@@ -524,6 +524,7 @@ class RagPipelineTest(unittest.TestCase):
         self.assertEqual(row_completed_event["review_status"], rag.STATUS_READY_FOR_REVIEW)
         self.assertEqual(row_completed_event["valid_citation_count"], 1)
         self.assertEqual(row_completed_event["retrieved_chunk_count"], 1)
+        self.assertEqual(log_events[-1]["status"], rag.LOG_STATUS_COMPLETED)
 
     def test_publish_export_packet_emits_structured_export_logs(self):
         """Export publication should emit staging and final publish events."""
@@ -577,6 +578,7 @@ class RagPipelineTest(unittest.TestCase):
                 "export_published",
             ],
         )
+        self.assertEqual(log_events[-1]["status"], rag.LOG_STATUS_COMPLETED)
         self.assertTrue(
             str(log_events[-1]["artifact_path"]).endswith("outputs")
         )
