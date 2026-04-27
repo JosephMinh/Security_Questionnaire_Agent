@@ -308,6 +308,20 @@ class EvidenceDocument:
 
 
 @dataclass(frozen=True)
+class EvidenceChunk:
+    """One deterministic chunk of normalized evidence text."""
+
+    source_file_name: str
+    source_path: Path
+    doc_type: str
+    text: str
+    chunk_number: int
+    start_offset: int
+    end_offset: int
+    page_number: int | None = None
+
+
+@dataclass(frozen=True)
 class VerificationCommand:
     """One canonical verification command and the conditions around it."""
 
@@ -832,6 +846,80 @@ def normalize_evidence_documents(
     return tuple(normalize_evidence_document(document) for document in documents)
 
 
+def _chunk_boundaries(
+    text: str,
+    *,
+    chunk_size: int = CHUNK_SIZE_CHARS,
+    chunk_overlap: int = CHUNK_OVERLAP_CHARS,
+) -> tuple[tuple[int, int], ...]:
+    """Return deterministic inclusive-exclusive chunk boundaries for one text."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer.")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap cannot be negative.")
+    if chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be smaller than chunk_size.")
+    if not text:
+        return ()
+
+    chunk_step = chunk_size - chunk_overlap
+    boundaries: list[tuple[int, int]] = []
+    start_offset = 0
+    while start_offset < len(text):
+        end_offset = min(start_offset + chunk_size, len(text))
+        boundaries.append((start_offset, end_offset))
+        if end_offset >= len(text):
+            break
+        start_offset += chunk_step
+    return tuple(boundaries)
+
+
+def chunk_evidence_document(
+    document: EvidenceDocument,
+    *,
+    chunk_size: int = CHUNK_SIZE_CHARS,
+    chunk_overlap: int = CHUNK_OVERLAP_CHARS,
+) -> tuple[EvidenceChunk, ...]:
+    """Split one normalized evidence document into deterministic overlapping chunks."""
+    boundaries = _chunk_boundaries(
+        document.text,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    return tuple(
+        EvidenceChunk(
+            source_file_name=document.source_file_name,
+            source_path=document.source_path,
+            doc_type=document.doc_type,
+            text=document.text[start_offset:end_offset],
+            chunk_number=chunk_number,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            page_number=document.page_number,
+        )
+        for chunk_number, (start_offset, end_offset) in enumerate(boundaries, start=1)
+    )
+
+
+def chunk_evidence_documents(
+    documents: Sequence[EvidenceDocument],
+    *,
+    chunk_size: int = CHUNK_SIZE_CHARS,
+    chunk_overlap: int = CHUNK_OVERLAP_CHARS,
+) -> tuple[EvidenceChunk, ...]:
+    """Chunk normalized evidence documents while preserving input order."""
+    chunked_documents: list[EvidenceChunk] = []
+    for document in documents:
+        chunked_documents.extend(
+            chunk_evidence_document(
+                document,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+        )
+    return tuple(chunked_documents)
+
+
 def _parse_evidence_display_value(value: str) -> list[str]:
     """Split the friendly workbook evidence cell into individual labels."""
     return [label for label in value.split("; ") if label]
@@ -1022,6 +1110,7 @@ __all__ = [
     "E2E_TESTS_DIR",
     "E2E_TEST_LOGS_DIR",
     "ENCRYPTION_POLICY_FILE_NAME",
+    "EvidenceChunk",
     "EvidenceDocument",
     "EXPECTED_OUTCOMES_FIXTURE_PATH",
     "EXPECTED_EVIDENCE_FILE_NAMES",
@@ -1112,6 +1201,8 @@ __all__ = [
     "WORKSPACE_FIXTURES_DIR",
     "build_citation_display_label",
     "build_evidence_display_value",
+    "chunk_evidence_document",
+    "chunk_evidence_documents",
     "confidence_band_for_score",
     "load_curated_pdf_evidence_documents",
     "load_curated_text_evidence_documents",
