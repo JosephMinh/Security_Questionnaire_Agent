@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
@@ -1057,6 +1058,12 @@ def review_summary_output_path(output_dir: Path | None = None) -> Path:
     """Return the canonical review-summary markdown path for one completed run."""
     base_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
     return base_output_dir / REVIEW_SUMMARY_FILE_NAME
+
+
+def needs_review_output_path(output_dir: Path | None = None) -> Path:
+    """Return the canonical review-queue CSV path for one completed run."""
+    base_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
+    return base_output_dir / NEEDS_REVIEW_FILE_NAME
 
 
 def completed_run_timestamp(timestamp: str | None = None) -> str:
@@ -2774,6 +2781,32 @@ def review_rows_in_priority_order(
     )
 
 
+def build_needs_review_rows(
+    questionnaire: RuntimeQuestionnaire,
+) -> list[dict[str, str]]:
+    """Render only review-bound rows in the exact CSV contract order."""
+    review_rows = []
+    for row in review_rows_in_priority_order(questionnaire):
+        reviewer_note = row.get("reviewer_note")
+        note_text = (
+            reviewer_note.strip()
+            if isinstance(reviewer_note, str)
+            else FALLBACK_REVIEWER_NOTE
+        )
+        review_rows.append(
+            {
+                "Question ID": str(row["question_id"]),
+                "Category": str(row["category"]),
+                "Question": str(row["question"]),
+                "Answer": str(row["answer"]),
+                "Confidence": str(row["confidence_band"]),
+                "Status": str(row["status"]),
+                "Reviewer Notes": note_text or FALLBACK_REVIEWER_NOTE,
+            }
+        )
+    return review_rows
+
+
 def final_index_action_for_questionnaire(questionnaire: RuntimeQuestionnaire) -> str:
     """Return the final non-empty index action recorded across the completed run rows."""
     index_actions = [
@@ -2865,6 +2898,21 @@ def write_review_summary(
         ),
         encoding="utf-8",
     )
+    return output_path
+
+
+def write_needs_review_csv(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    output_dir: Path | None = None,
+) -> Path:
+    """Write the standalone review-queue CSV to the canonical outputs directory."""
+    output_path = needs_review_output_path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_QUEUE_COLUMNS)
+        writer.writeheader()
+        writer.writerows(build_needs_review_rows(questionnaire))
     return output_path
 
 
@@ -3213,6 +3261,7 @@ __all__ = [
     "MEDIUM_CONFIDENCE_THRESHOLD",
     "MODEL_RETRY_LIMIT",
     "NEEDS_REVIEW_FILE_NAME",
+    "needs_review_output_path",
     "OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES",
     "OUTPUTS_DIR",
     "PARTIAL_SCORE",
@@ -3262,6 +3311,7 @@ __all__ = [
     "WORKSPACE_FIXTURES_DIR",
     "build_answer_prompt_messages",
     "build_answered_questionnaire_workbook",
+    "build_needs_review_rows",
     "build_review_summary_markdown",
     "build_answer_user_prompt",
     "build_citation_display_label",
@@ -3317,5 +3367,6 @@ __all__ = [
     "verification_command_by_name",
     "verification_sequence_shell_commands",
     "write_answered_questionnaire",
+    "write_needs_review_csv",
     "write_review_summary",
 ]
