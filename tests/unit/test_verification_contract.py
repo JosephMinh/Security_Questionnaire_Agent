@@ -32,6 +32,7 @@ class VerificationContractTests(unittest.TestCase):
                 "ui_suite",
                 "deterministic_e2e",
                 "failure_e2e",
+                "blocked_recovery_e2e",
                 "live_smoke",
                 "closeout_audit",
             },
@@ -48,9 +49,16 @@ class VerificationContractTests(unittest.TestCase):
             OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES
         )
         self.assertEqual(len(quick_commands), 1)
-        self.assertEqual(len(full_commands), 4)
+        self.assertEqual(len(full_commands), 5)
         self.assertEqual(len(live_commands), 1)
+        ui_command = verification_command_by_name("ui_suite")
+        self.assertEqual(
+            ui_command.argv,
+            ("python", "-m", "unittest", "tests.unit.app_test", "-v"),
+        )
         self.assertIn("tests/e2e/run_deterministic_demo.py", full_commands[2])
+        self.assertIn("tests/e2e/run_failure_paths.py", full_commands[3])
+        self.assertIn("tests/e2e/run_blocked_recovery_paths_test.py", full_commands[4])
         self.assertIn("Q01 Q17 Q21", live_commands[0])
 
     def test_closeout_audit_command_and_rules_are_explicit(self) -> None:

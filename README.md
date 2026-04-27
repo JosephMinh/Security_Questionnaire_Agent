@@ -42,9 +42,10 @@ Shared full local validation contract for the remaining automation beads:
 
 ```bash
 python -m unittest discover -s tests/unit -p '*_test.py' -v
-python -m unittest discover -s tests/ui -p '*_test.py' -v
+python -m unittest tests.unit.app_test -v
 python tests/e2e/run_deterministic_demo.py --log-dir data/outputs/verification/e2e --verbose
 python tests/e2e/run_failure_paths.py --log-dir data/outputs/verification/e2e --verbose
+python tests/e2e/run_blocked_recovery_paths_test.py --log-dir data/outputs/verification/e2e --verbose
 ```
 
 Use `br-closeout-audit --issue <issue-id>` before closing high-risk beads and again after verification-heavy test or logging changes.

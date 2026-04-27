@@ -660,11 +660,7 @@ CANONICAL_VERIFICATION_COMMANDS: Final[tuple[VerificationCommand, ...]] = (
             "python",
             "-m",
             "unittest",
-            "discover",
-            "-s",
-            "tests/ui",
-            "-p",
-            "*_test.py",
+            "tests.unit.app_test",
             "-v",
         ),
         purpose="Page-level Streamlit checks for the golden-path operator workflow.",
@@ -695,8 +691,23 @@ CANONICAL_VERIFICATION_COMMANDS: Final[tuple[VerificationCommand, ...]] = (
             "--verbose",
         ),
         purpose=(
-            "Failure, retry, review-routing, blocked-state, and index-reuse/rebuild "
-            "coverage with deterministic fixtures."
+            "Failure, retry, review-routing, and index-reuse/rebuild coverage with "
+            "deterministic fixtures."
+        ),
+        artifacts_dir=E2E_TEST_LOGS_DIR,
+    ),
+    VerificationCommand(
+        name="blocked_recovery_e2e",
+        argv=(
+            "python",
+            "tests/e2e/run_blocked_recovery_paths_test.py",
+            "--log-dir",
+            str(E2E_TEST_LOGS_DIR),
+            "--verbose",
+        ),
+        purpose=(
+            "Blocked-state guidance, recovery actions, and integrity-triggered rebuild "
+            "coverage through the Streamlit workflow."
         ),
         artifacts_dir=E2E_TEST_LOGS_DIR,
     ),
@@ -738,6 +749,7 @@ FULL_LOCAL_VALIDATION_COMMAND_NAMES: Final[tuple[str, ...]] = (
     "ui_suite",
     "deterministic_e2e",
     "failure_e2e",
+    "blocked_recovery_e2e",
 )
 OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES: Final[tuple[str, ...]] = ("live_smoke",)
 
