@@ -799,6 +799,39 @@ def load_curated_pdf_evidence_documents(
     return tuple(page_documents)
 
 
+def normalize_evidence_text(text: str) -> str:
+    """Normalize text deterministically while preserving headings and structure."""
+    normalized_line_endings = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_lines: list[str] = []
+    previous_line_blank = False
+    for raw_line in normalized_line_endings.split("\n"):
+        line = raw_line.rstrip()
+        line_is_blank = line == ""
+        if line_is_blank and previous_line_blank:
+            continue
+        normalized_lines.append(line)
+        previous_line_blank = line_is_blank
+    return "\n".join(normalized_lines).strip("\n")
+
+
+def normalize_evidence_document(document: EvidenceDocument) -> EvidenceDocument:
+    """Return one evidence document with normalized text and unchanged metadata."""
+    return EvidenceDocument(
+        source_file_name=document.source_file_name,
+        source_path=document.source_path,
+        doc_type=document.doc_type,
+        text=normalize_evidence_text(document.text),
+        page_number=document.page_number,
+    )
+
+
+def normalize_evidence_documents(
+    documents: Sequence[EvidenceDocument],
+) -> tuple[EvidenceDocument, ...]:
+    """Normalize a sequence of loaded evidence documents in stable order."""
+    return tuple(normalize_evidence_document(document) for document in documents)
+
+
 def _parse_evidence_display_value(value: str) -> list[str]:
     """Split the friendly workbook evidence cell into individual labels."""
     return [label for label in value.split("; ") if label]
@@ -1086,6 +1119,9 @@ __all__ = [
     "load_runtime_questionnaire",
     "load_text_evidence_document",
     "make_result_row_defaults",
+    "normalize_evidence_document",
+    "normalize_evidence_documents",
+    "normalize_evidence_text",
     "question_order_index",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
