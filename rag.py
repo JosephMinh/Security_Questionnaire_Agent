@@ -2615,6 +2615,15 @@ def _reviewer_note_with_fallback(raw_value: object) -> str:
     return FALLBACK_REVIEWER_NOTE
 
 
+def _visible_reviewer_note(raw_value: object, status: object) -> str:
+    """Return the reviewer-facing note for one completed row."""
+    if status == STATUS_READY_FOR_REVIEW:
+        if isinstance(raw_value, str):
+            return raw_value.strip()
+        return ""
+    return _reviewer_note_with_fallback(raw_value)
+
+
 def validate_answer_payload(
     payload: Mapping[str, object],
     retrieved_chunks: Sequence[RetrievedEvidenceChunk],
@@ -3690,7 +3699,10 @@ def update_row_with_answer_result(
     evidence_labels = [
         citation.display_label for citation in answer_result.citations if citation.display_label
     ]
-    reviewer_note = _reviewer_note_with_fallback(answer_result.reviewer_note)
+    reviewer_note = _visible_reviewer_note(
+        answer_result.reviewer_note,
+        answer_result.status,
+    )
     updated_row = dict(row_like)
     updated_row.update(
         {

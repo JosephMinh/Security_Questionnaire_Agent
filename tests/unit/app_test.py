@@ -841,6 +841,10 @@ class AppRunSectionTest(unittest.TestCase):
         self.assertEqual(inspector_selectbox.value, "Q01")
         review_queue_dataframe = at.dataframe[1].value
         self.assertEqual(list(review_queue_dataframe["Question ID"]), ["Q02"])
+        markdown_values = [markdown.value for markdown in at.markdown]
+        self.assertFalse(
+            any(rag.FALLBACK_REVIEWER_NOTE in value for value in markdown_values)
+        )
 
     def test_results_surface_question_inspector_shows_provenance_and_switches_rows(
         self,

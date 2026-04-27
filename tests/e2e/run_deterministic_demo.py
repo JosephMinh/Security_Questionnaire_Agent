@@ -451,8 +451,8 @@ def _validate_completed_questionnaire(
             )
         else:
             _require(
-                str(row["Reviewer Notes"]) == rag.FALLBACK_REVIEWER_NOTE,
-                f"{question_id} supported row did not retain the fallback reviewer note.",
+                str(row["Reviewer Notes"]) == "",
+                f"{question_id} row should stay free of filler reviewer-note text.",
             )
 
         primary_source = expected_question.get("primary_source")

@@ -186,6 +186,7 @@ class RagExportTest(unittest.TestCase):
             )
             self.assertEqual(rows[2][0], "Q02")
             self.assertEqual(rows[2][6], rag.STATUS_NEEDS_REVIEW)
+            self.assertIn(rows[1][7], ("", None))
             self.assertEqual(worksheet.freeze_panes, "A2")
             self.assertEqual(worksheet.auto_filter.ref, "A1:H3")
             self.assertTrue(all(cell.font.bold for cell in worksheet[1]))

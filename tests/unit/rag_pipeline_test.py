@@ -209,7 +209,7 @@ class RagPipelineTest(unittest.TestCase):
         )
         self.assertEqual(updated["Confidence"], rag.CONFIDENCE_BAND_HIGH)
         self.assertEqual(updated["Status"], rag.STATUS_READY_FOR_REVIEW)
-        self.assertEqual(updated["Reviewer Notes"], rag.FALLBACK_REVIEWER_NOTE)
+        self.assertEqual(updated["Reviewer Notes"], "")
         self.assertEqual(updated["answer_type"], rag.ANSWER_TYPE_SUPPORTED)
         self.assertEqual(updated["citation_ids"], ["enc_001", "soc2_001"])
         self.assertEqual([citation.chunk_id for citation in updated["citations"]], ["enc_001", "soc2_001"])
@@ -217,6 +217,7 @@ class RagPipelineTest(unittest.TestCase):
             updated["evidence_labels"],
             ["Encryption Policy — Data at Rest", "SOC 2 Summary — Page 2"],
         )
+        self.assertEqual(updated["reviewer_note"], "")
         self.assertEqual(updated["index_action"], rag.INDEX_ACTION_REUSED)
         self.assertEqual(updated["run_id"], "run-001")
 
