@@ -123,6 +123,26 @@ INDEX_ACTION_REUSED: Final[str] = "reused"
 INDEX_ACTION_REBUILT_CONTENT_CHANGE: Final[str] = "rebuilt_content_change"
 INDEX_ACTION_REBUILT_INTEGRITY: Final[str] = "rebuilt_integrity"
 INDEX_ACTION_BLOCKED: Final[str] = "blocked"
+AUTO_REBUILD_INTEGRITY_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "collection_empty",
+        "chunk_count_missing",
+        "chunk_count_mismatch",
+        "collection_payload_mismatch",
+        "duplicate_logical_chunk_ids",
+        "expected_chunk_count_mismatch",
+        "logical_chunk_id_mismatch",
+        "metadata_chunk_id_missing",
+        "metadata_missing",
+        "source_coverage_mismatch",
+    }
+)
+BLOCKED_INDEX_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "expected_chunks_unavailable",
+        "manifest_unavailable",
+    }
+)
 
 REQUIRED_ENV_VARS: Final[tuple[str, ...]] = ("OPENAI_API_KEY",)
 
@@ -950,10 +970,43 @@ def record_indexed_workspace_state(
     return metadata
 
 
+def _expected_curated_chunk_inventory(
+    evidence_dir: Path | None = None,
+) -> tuple[int, frozenset[str], frozenset[str]]:
+    """Return the deterministic chunk-count, chunk-id, and source inventory."""
+    expected_chunks = build_curated_evidence_chunks(evidence_dir)
+    expected_chunk_ids = tuple(chunk.chunk_id for chunk in expected_chunks)
+    if any(chunk_id is None for chunk_id in expected_chunk_ids):
+        raise ValueError("Curated evidence chunks must provide chunk IDs for integrity checks.")
+
+    return (
+        len(expected_chunks),
+        frozenset(str(chunk_id) for chunk_id in expected_chunk_ids),
+        frozenset(chunk.source for chunk in expected_chunks),
+    )
+
+
+def _stored_collection_payload(
+    collection_handle: ChromaCollectionHandle,
+) -> tuple[tuple[str, ...], tuple[dict[str, Any] | None, ...]]:
+    """Return one storage payload snapshot for integrity inspection."""
+    payload = collection_handle.collection.get(include=["metadatas"])
+    raw_ids = payload.get("ids")
+    raw_metadatas = payload.get("metadatas")
+    stored_ids = tuple(str(raw_id) for raw_id in raw_ids) if isinstance(raw_ids, list) else ()
+    stored_metadatas = (
+        tuple(raw_metadata if isinstance(raw_metadata, dict) else None for raw_metadata in raw_metadatas)
+        if isinstance(raw_metadatas, list)
+        else ()
+    )
+    return stored_ids, stored_metadatas
+
+
 def evaluate_chroma_reuse(
     *,
     collection_name: str = COLLECTION_NAME,
     persist_directory: Path | None = None,
+    evidence_dir: Path | None = None,
     manifest_path: Path | None = None,
 ) -> ChromaReuseStatus:
     """Return whether the existing collection can be safely reused."""
@@ -999,7 +1052,23 @@ def evaluate_chroma_reuse(
         if isinstance(raw_stored_chunk_count, int) and raw_stored_chunk_count >= 0
         else None
     )
-    actual_chunk_count = int(collection_handle.collection.count())
+    try:
+        actual_chunk_count = int(collection_handle.collection.count())
+    except Exception:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=(
+                stored_workspace_hash if isinstance(stored_workspace_hash, str) else None
+            ),
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=0,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="collection_payload_mismatch",
+            collection_handle=collection_handle,
+        )
 
     if stored_workspace_hash != workspace_hash:
         return ChromaReuseStatus(
@@ -1031,7 +1100,7 @@ def evaluate_chroma_reuse(
             collection_handle=collection_handle,
         )
 
-    if actual_chunk_count != stored_chunk_count or actual_chunk_count == 0:
+    if actual_chunk_count == 0:
         return ChromaReuseStatus(
             collection_name=collection_name,
             persist_directory=collection_handle.persist_directory,
@@ -1041,7 +1110,182 @@ def evaluate_chroma_reuse(
             actual_chunk_count=actual_chunk_count,
             index_action=INDEX_ACTION_BLOCKED,
             reusable=False,
-            reason="integrity_check_failed",
+            reason="collection_empty",
+            collection_handle=collection_handle,
+        )
+
+    if actual_chunk_count != stored_chunk_count:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="chunk_count_mismatch",
+            collection_handle=collection_handle,
+        )
+
+    try:
+        (
+            expected_chunk_count,
+            expected_chunk_ids,
+            expected_sources,
+        ) = _expected_curated_chunk_inventory(evidence_dir)
+    except (FileNotFoundError, ModuleNotFoundError, ValueError):
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="expected_chunks_unavailable",
+            collection_handle=collection_handle,
+        )
+
+    if actual_chunk_count != expected_chunk_count:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="expected_chunk_count_mismatch",
+            collection_handle=collection_handle,
+        )
+
+    try:
+        stored_ids, stored_metadatas = _stored_collection_payload(collection_handle)
+    except Exception:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="collection_payload_mismatch",
+            collection_handle=collection_handle,
+        )
+    if (
+        len(stored_ids) != actual_chunk_count
+        or len(stored_metadatas) != actual_chunk_count
+        or frozenset(stored_ids) != expected_chunk_ids
+    ):
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="collection_payload_mismatch",
+            collection_handle=collection_handle,
+        )
+
+    if any(metadata is None for metadata in stored_metadatas):
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="metadata_missing",
+            collection_handle=collection_handle,
+        )
+
+    logical_chunk_ids: list[str] = []
+    stored_sources: list[str] = []
+    for metadata in stored_metadatas:
+        if metadata is None:
+            continue
+
+        logical_chunk_id = metadata.get("chunk_id")
+        if not isinstance(logical_chunk_id, str) or not logical_chunk_id.strip():
+            return ChromaReuseStatus(
+                collection_name=collection_name,
+                persist_directory=collection_handle.persist_directory,
+                workspace_hash=workspace_hash,
+                stored_workspace_hash=workspace_hash,
+                stored_chunk_count=stored_chunk_count,
+                actual_chunk_count=actual_chunk_count,
+                index_action=INDEX_ACTION_BLOCKED,
+                reusable=False,
+                reason="metadata_chunk_id_missing",
+                collection_handle=collection_handle,
+            )
+        logical_chunk_ids.append(logical_chunk_id)
+
+        source_name = metadata.get("source")
+        if not isinstance(source_name, str) or not source_name.strip():
+            return ChromaReuseStatus(
+                collection_name=collection_name,
+                persist_directory=collection_handle.persist_directory,
+                workspace_hash=workspace_hash,
+                stored_workspace_hash=workspace_hash,
+                stored_chunk_count=stored_chunk_count,
+                actual_chunk_count=actual_chunk_count,
+                index_action=INDEX_ACTION_BLOCKED,
+                reusable=False,
+                reason="source_coverage_mismatch",
+                collection_handle=collection_handle,
+            )
+        stored_sources.append(source_name)
+
+    if len(set(logical_chunk_ids)) != len(logical_chunk_ids):
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="duplicate_logical_chunk_ids",
+            collection_handle=collection_handle,
+        )
+
+    if frozenset(logical_chunk_ids) != expected_chunk_ids:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="logical_chunk_id_mismatch",
+            collection_handle=collection_handle,
+        )
+
+    if frozenset(stored_sources) != expected_sources:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="source_coverage_mismatch",
             collection_handle=collection_handle,
         )
 
@@ -1499,6 +1743,7 @@ def rebuild_curated_evidence_index(
     persist_directory: Path | None = None,
     evidence_dir: Path | None = None,
     manifest_path: Path | None = None,
+    index_action: str = INDEX_ACTION_REBUILT_CONTENT_CHANGE,
     reason: str = "workspace_hash_changed",
 ) -> ChromaIndexStatus:
     """Delete and recreate the canonical demo index for the current workspace."""
@@ -1511,7 +1756,7 @@ def rebuild_curated_evidence_index(
         persist_directory=persist_directory,
         evidence_dir=evidence_dir,
         manifest_path=manifest_path,
-        index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
+        index_action=index_action,
         reason=reason,
     )
 
@@ -1528,10 +1773,11 @@ def ensure_curated_evidence_index(
     reuse_status = evaluate_chroma_reuse(
         collection_name=collection_name,
         persist_directory=persist_directory,
+        evidence_dir=evidence_dir,
         manifest_path=manifest_path,
     )
     if force_rebuild:
-        if reuse_status.reason == "manifest_unavailable":
+        if reuse_status.reason in BLOCKED_INDEX_REASONS:
             return _index_status_from_reuse_status(reuse_status)
         if reuse_status.reason == "collection_missing":
             return create_curated_evidence_index(
@@ -1545,6 +1791,7 @@ def ensure_curated_evidence_index(
             persist_directory=persist_directory,
             evidence_dir=evidence_dir,
             manifest_path=manifest_path,
+            index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
             reason="force_rebuild",
         )
 
@@ -1565,11 +1812,20 @@ def ensure_curated_evidence_index(
             persist_directory=persist_directory,
             evidence_dir=evidence_dir,
             manifest_path=manifest_path,
+            index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
             reason="workspace_hash_changed",
         )
 
-    # Integrity or manifest-read failures stay blocked here so the later stale-state
-    # guard can decide whether the safest outcome is a rebuild or an operator-visible stop.
+    if reuse_status.reason in AUTO_REBUILD_INTEGRITY_REASONS:
+        return rebuild_curated_evidence_index(
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            evidence_dir=evidence_dir,
+            manifest_path=manifest_path,
+            index_action=INDEX_ACTION_REBUILT_INTEGRITY,
+            reason=reuse_status.reason,
+        )
+
     return _index_status_from_reuse_status(reuse_status)
 
 
