@@ -782,8 +782,8 @@ def runtime_evidence_directory() -> Path:
 def chroma_persist_directory(persist_directory: Path | None = None) -> Path:
     """Return the stable local persistence directory for the Chroma demo index."""
     if persist_directory is None:
-        return CHROMA_DIR
-    return Path(persist_directory)
+        return CHROMA_DIR.resolve()
+    return Path(persist_directory).expanduser().resolve()
 
 
 def _import_chromadb() -> Any:
