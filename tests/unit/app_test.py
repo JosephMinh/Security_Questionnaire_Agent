@@ -153,6 +153,39 @@ def _published_export_packet(
 class AppRunSectionTest(unittest.TestCase):
     """Verify the run-control UI stays wired to the canonical pipeline contract."""
 
+    def test_header_and_workspace_controls_match_planned_labels(self) -> None:
+        """The top-level framing and primary workspace controls should stay camera-ready."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.run()
+
+        self.assertEqual([title.value for title in at.title], [rag.APP_TITLE])
+        self.assertIn(rag.APP_SUBTITLE, [caption.value for caption in at.caption])
+        self.assertTrue(
+            any(rag.DEMO_MODE_LABEL in markdown.value for markdown in at.markdown)
+        )
+        self.assertEqual([expander.label for expander in at.expander], ["Advanced"])
+        self.assertEqual(
+            [(button.label, button.disabled) for button in at.button],
+            [
+                ("Load Demo Workspace", False),
+                ("Rebuild Index", False),
+                ("Reset Demo", False),
+                ("Run Copilot", False),
+                ("Publish Export Packet", True),
+            ],
+        )
+
     def test_run_section_shows_total_count_and_idle_status(self) -> None:
         """The run section should expose count, trigger, and resting progress copy."""
         questionnaire = _runtime_questionnaire(
@@ -368,6 +401,63 @@ class AppRunSectionTest(unittest.TestCase):
             any("Copilot run finished." in success.value for success in at.success)
         )
 
+    def test_workspace_section_surfaces_invalid_workspace_guidance_and_recovery_controls(
+        self,
+    ) -> None:
+        """Blocked workspace states should explain the problem and leave recovery controls visible."""
+        invalid_snapshot = app.WorkspaceSnapshot(
+            questionnaire_exists=False,
+            manifest_exists=False,
+            evidence_present_count=0,
+            evidence_total_count=5,
+            validation_ok=False,
+            validation_lines=(
+                "Runtime workspace manifest is missing. Run `Load Demo Workspace` to restore the curated assets.",
+                "If the local cache still looks stale after reload, use `Reset Demo` to rebuild the workspace from scratch.",
+            ),
+            workspace_hash=None,
+            index_ready=False,
+            index_action=rag.INDEX_ACTION_BLOCKED,
+            index_reason="manifest_unavailable",
+            actual_chunk_count=0,
+            stored_chunk_count=None,
+            stored_workspace_hash=None,
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=invalid_snapshot):
+            with patch.object(app, "_missing_required_environment", return_value=()):
+                at = AppTest.from_function(_run_app_main)
+                at.run()
+
+        self.assertIn("Workspace validation failed.", [error.value for error in at.error])
+        markdown_values = [markdown.value for markdown in at.markdown]
+        self.assertTrue(
+            any(
+                "Run `Load Demo Workspace` to restore the curated assets."
+                in value
+                for value in markdown_values
+            )
+        )
+        self.assertTrue(
+            any(
+                "use `Reset Demo` to rebuild the workspace from scratch." in value
+                for value in markdown_values
+            )
+        )
+        self.assertIn(
+            "Fix the workspace validation issues above before starting the copilot run.",
+            [caption.value for caption in at.caption],
+        )
+        self.assertEqual(
+            [(button.label, button.disabled) for button in at.button[:4]],
+            [
+                ("Load Demo Workspace", False),
+                ("Rebuild Index", False),
+                ("Reset Demo", False),
+                ("Run Copilot", True),
+            ],
+        )
+
     def test_run_section_blocks_when_required_environment_is_missing(self) -> None:
         """Missing provider configuration should disable the run path with guidance."""
         questionnaire = _runtime_questionnaire(
@@ -581,6 +671,43 @@ class AppRunSectionTest(unittest.TestCase):
         )
         self.assertNotIn(app.RESULTS_QUESTIONNAIRE_KEY, at.session_state)
         self.assertNotIn(app.LAST_RUN_ID_KEY, at.session_state)
+
+    def test_busy_run_state_disables_conflicting_controls_and_explains_waiting(self) -> None:
+        """While a run is busy, every conflicting visible control should stay disabled."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.session_state[app.RUN_BUSY_KEY] = True
+                    at.run()
+
+        self.assertEqual(
+            [(button.label, button.disabled) for button in at.button],
+            [
+                ("Load Demo Workspace", True),
+                ("Rebuild Index", True),
+                ("Reset Demo", True),
+                ("Run Copilot", True),
+                ("Publish Export Packet", True),
+            ],
+        )
+        caption_values = [caption.value for caption in at.caption]
+        self.assertIn(
+            "Another app action is finishing. Wait for it to complete before starting a new one.",
+            caption_values,
+        )
+        self.assertIn(
+            "Another app action is finishing. Wait for it to complete before exporting.",
+            caption_values,
+        )
 
     def test_results_surface_defaults_to_lowest_confidence_needs_review_and_sorts_queue(
         self,
