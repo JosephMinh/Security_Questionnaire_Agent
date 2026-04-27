@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from shlex import join as shell_join
 from typing import Any, Final, Mapping, Sequence
@@ -117,6 +118,28 @@ CHUNK_OVERLAP_CHARS: Final[int] = 100
 RETRIEVAL_TOP_K: Final[int] = 5
 MAX_VISIBLE_CITATIONS: Final[int] = 2
 MODEL_RETRY_LIMIT: Final[int] = 1
+DEFAULT_OPENAI_ANSWER_MODEL: Final[str] = "gpt-4.1-mini"
+ANSWER_OUTPUT_KEYS: Final[tuple[str, ...]] = (
+    "answer",
+    "answer_type",
+    "citation_ids",
+    "reviewer_note",
+)
+ANSWER_RESPONSE_SCHEMA_NAME: Final[str] = "security_questionnaire_answer"
+ANSWER_RESPONSE_JSON_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answer": {"type": "string"},
+        "answer_type": {"type": "string", "enum": list(ANSWER_TYPES)},
+        "citation_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "reviewer_note": {"type": "string"},
+    },
+    "required": list(ANSWER_OUTPUT_KEYS),
+}
 
 INDEX_ACTION_CREATED: Final[str] = "created"
 INDEX_ACTION_REUSED: Final[str] = "reused"
@@ -786,6 +809,25 @@ LOGGING_CONVENTIONS: Final[tuple[str, ...]] = (
     "Always include the required fields and only include optional fields when they add real diagnostic value.",
     "Use question_id for row-level events, workspace_hash or manifest_hash for reuse decisions, and artifact_path for published outputs.",
     "Do not log API keys, raw secrets, or full provider transcripts by default.",
+)
+
+CONSERVATIVE_ANSWER_SYSTEM_PROMPT: Final[str] = "\n".join(
+    (
+        "You answer one security questionnaire row using only the provided evidence chunks.",
+        "Answer only from the provided evidence chunks.",
+        "Do not use outside knowledge.",
+        "Do not invent policies, timelines, capabilities, or citations.",
+        "Return valid JSON with exactly these keys: answer, answer_type, citation_ids, reviewer_note.",
+        "answer_type must be one of: supported, partial, unsupported.",
+        "If evidence is incomplete, use partial.",
+        "If evidence is missing, use unsupported.",
+        "The answer must be 1 to 3 sentences.",
+        "The answer must begin with exactly one of: Yes., No., Partially., Not stated.",
+        "Keep the answer short and readable.",
+        "Use only chunk_id values from the provided evidence list in citation_ids.",
+        "Do not include raw filenames in the answer unless necessary.",
+        "Keep reviewer_note short and reviewer-oriented.",
+    )
 )
 
 
@@ -1875,6 +1917,136 @@ def _question_identifier(row_like: Mapping[str, object]) -> str:
     return "<unknown-question>"
 
 
+def _load_dotenv_if_available() -> None:
+    """Load repo-local .env values when python-dotenv is available."""
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        return
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
+
+def _openai_answer_client(openai_client: Any | None = None) -> Any:
+    """Return the OpenAI client used for provider-backed answer generation."""
+    if openai_client is not None:
+        return openai_client
+
+    _load_dotenv_if_available()
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is required for provider-backed answer generation. Set it "
+            "in the shell or repo-local `.env` before calling the answer pipeline."
+        )
+
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "openai is required for provider-backed answer generation. Install "
+            "dependencies with `pip install -r requirements.txt`."
+        ) from exc
+    return OpenAI(api_key=openai_api_key)
+
+
+def format_retrieved_chunk_for_prompt(chunk: RetrievedEvidenceChunk) -> str:
+    """Render one retrieved chunk in the readable prompt shape from the plan."""
+    metadata_parts = [f"source={chunk.source}"]
+    if chunk.section:
+        metadata_parts.append(f"section={chunk.section}")
+    if chunk.page is not None:
+        metadata_parts.append(f"page={chunk.page}")
+    metadata_suffix = " ".join(metadata_parts)
+    return f"[{chunk.chunk_id}] {metadata_suffix}\n{chunk.text}"
+
+
+def build_answer_user_prompt(
+    question_text: str,
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+) -> str:
+    """Build the conservative user prompt with question text and retrieved evidence."""
+    normalized_question_text = question_text.strip()
+    if not normalized_question_text:
+        raise ValueError("question_text must be a non-empty string.")
+
+    evidence_section = "\n\n".join(
+        format_retrieved_chunk_for_prompt(chunk) for chunk in retrieved_chunks
+    )
+    if not evidence_section:
+        evidence_section = "<none provided>"
+
+    return "\n".join(
+        (
+            "Question:",
+            normalized_question_text,
+            "",
+            "Evidence chunks:",
+            evidence_section,
+        )
+    )
+
+
+def build_answer_prompt_messages(
+    question_text: str,
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+) -> tuple[dict[str, str], ...]:
+    """Return the exact system/user prompt messages for the answer-generation call."""
+    return (
+        {"role": "system", "content": CONSERVATIVE_ANSWER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": build_answer_user_prompt(question_text, retrieved_chunks),
+        },
+    )
+
+
+def generate_answer_payload(
+    question_text: str,
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+    *,
+    model: str = DEFAULT_OPENAI_ANSWER_MODEL,
+    openai_client: Any | None = None,
+) -> dict[str, object]:
+    """Call the provider-backed answer path and return the raw structured JSON payload."""
+    normalized_model = model.strip()
+    if not normalized_model:
+        raise ValueError("model must be a non-empty string.")
+
+    client = _openai_answer_client(openai_client)
+    response = client.chat.completions.create(
+        model=normalized_model,
+        messages=list(build_answer_prompt_messages(question_text, retrieved_chunks)),
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": ANSWER_RESPONSE_SCHEMA_NAME,
+                "schema": ANSWER_RESPONSE_JSON_SCHEMA,
+                "strict": True,
+            },
+        },
+    )
+
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("OpenAI answer generation returned no completion choices.")
+
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenAI answer generation returned an empty JSON payload.")
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "OpenAI answer generation returned malformed JSON for the answer payload."
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenAI answer generation returned a non-object JSON payload.")
+    return payload
+
+
 def retrieve_evidence_chunks(
     question_text: str,
     *,
@@ -2195,6 +2367,9 @@ def verification_sequence_shell_commands(
 __all__ = [
     "ACCESS_CONTROL_POLICY_FILE_NAME",
     "ANSWER_OPENING_TOKENS",
+    "ANSWER_OUTPUT_KEYS",
+    "ANSWER_RESPONSE_JSON_SCHEMA",
+    "ANSWER_RESPONSE_SCHEMA_NAME",
     "ANSWER_TYPE_PARTIAL",
     "ANSWER_TYPE_SUPPORTED",
     "ANSWER_TYPE_UNSUPPORTED",
@@ -2214,10 +2389,12 @@ __all__ = [
     "CONFIDENCE_BAND_HIGH",
     "CONFIDENCE_BAND_LOW",
     "CONFIDENCE_BAND_MEDIUM",
+    "CONSERVATIVE_ANSWER_SYSTEM_PROMPT",
     "CLOSEOUT_AUDIT_RULES",
     "CURATED_PDF_EVIDENCE_FILE_NAMES",
     "CURATED_TEXT_EVIDENCE_FILE_NAMES",
     "DATA_DIR",
+    "DEFAULT_OPENAI_ANSWER_MODEL",
     "DEMO_MODE_LABEL",
     "DOCUMENT_TYPE_MARKDOWN",
     "DOCUMENT_TYPE_PDF",
@@ -2315,6 +2492,8 @@ __all__ = [
     "VISIBLE_OUTPUT_COLUMNS",
     "WORKSPACE_HASH_DIRECTORIES",
     "WORKSPACE_FIXTURES_DIR",
+    "build_answer_prompt_messages",
+    "build_answer_user_prompt",
     "build_citation_display_label",
     "build_curated_evidence_chunks",
     "build_evidence_display_value",
@@ -2327,6 +2506,8 @@ __all__ = [
     "delete_existing_chroma_collection",
     "ensure_curated_evidence_index",
     "evaluate_chroma_reuse",
+    "format_retrieved_chunk_for_prompt",
+    "generate_answer_payload",
     "get_existing_chroma_collection",
     "get_or_create_chroma_collection",
     "get_or_create_demo_chroma_collection",
