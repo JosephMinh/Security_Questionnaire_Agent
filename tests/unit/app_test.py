@@ -88,17 +88,43 @@ def _answer_result(
     confidence_score: float,
     confidence_band: str,
     status: str,
+    reviewer_note: str = "",
+    citations: tuple[rag.ResolvedEvidenceCitation, ...] = (),
 ) -> rag.GeneratedAnswerResult:
     """Build one deterministic generated-answer result for UI tests."""
     return rag.GeneratedAnswerResult(
         answer=answer,
         answer_type=answer_type,
-        citation_ids=(),
-        citations=(),
+        citation_ids=tuple(citation.chunk_id for citation in citations),
+        citations=citations,
         confidence_score=confidence_score,
         confidence_band=confidence_band,
         status=status,
-        reviewer_note="",
+        reviewer_note=reviewer_note,
+    )
+
+
+def _citation(
+    *,
+    chunk_id: str,
+    display_label: str,
+    snippet_text: str,
+    source: str,
+    source_path: str,
+    doc_type: str,
+    section: str | None = None,
+    page: int | None = None,
+) -> rag.ResolvedEvidenceCitation:
+    """Build one resolved citation fixture for the question inspector."""
+    return rag.ResolvedEvidenceCitation(
+        chunk_id=chunk_id,
+        display_label=display_label,
+        snippet_text=snippet_text,
+        source=source,
+        source_path=Path(source_path),
+        doc_type=doc_type,
+        section=section,
+        page=page,
     )
 
 
@@ -396,6 +422,156 @@ class AppRunSectionTest(unittest.TestCase):
         )
         self.assertNotIn(app.RESULTS_QUESTIONNAIRE_KEY, at.session_state)
         self.assertNotIn(app.LAST_RUN_ID_KEY, at.session_state)
+
+    def test_results_surface_question_inspector_shows_provenance_and_switches_rows(
+        self,
+    ) -> None:
+        """The question inspector should expose processed rows, exact snippets, and row switching."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            ),
+            _runtime_row(
+                question_id="Q02",
+                category="Backups",
+                question="Are backups encrypted?",
+            ),
+            _runtime_row(
+                question_id="Q03",
+                category="Access",
+                question="Do you review privileged access?",
+            ),
+        )
+        results_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        results_questionnaire.rows[0] = rag.update_row_with_answer_result(
+            results_questionnaire.rows[0],
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest using AES-256 controls.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_HIGH,
+                status=rag.STATUS_READY_FOR_REVIEW,
+                reviewer_note="Validated against the policy control language.",
+                citations=(
+                    _citation(
+                        chunk_id="enc-001",
+                        display_label="Encryption Policy - Data at Rest",
+                        snippet_text="Customer data at rest is encrypted using AES-256.",
+                        source="Encryption_Policy.md",
+                        source_path="data/evidence/Encryption_Policy.md",
+                        doc_type=rag.DOCUMENT_TYPE_MARKDOWN,
+                        section="Data at Rest",
+                    ),
+                ),
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-002",
+        )
+        results_questionnaire.rows[1] = rag.update_row_with_answer_result(
+            results_questionnaire.rows[1],
+            _answer_result(
+                answer="Partially. Backup encryption covers managed jobs but not every legacy path.",
+                answer_type=rag.ANSWER_TYPE_PARTIAL,
+                confidence_score=rag.PARTIAL_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_LOW,
+                status=rag.STATUS_NEEDS_REVIEW,
+                reviewer_note="Confirm the remaining legacy backup scope manually.",
+                citations=(
+                    _citation(
+                        chunk_id="soc2-004",
+                        display_label="AcmeCloud SOC 2 Summary - Backup Controls",
+                        snippet_text="Backup jobs are encrypted in transit and at rest.",
+                        source="AcmeCloud_SOC2_Summary.pdf",
+                        source_path="data/evidence/AcmeCloud_SOC2_Summary.pdf",
+                        doc_type=rag.DOCUMENT_TYPE_PDF,
+                        page=4,
+                    ),
+                ),
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-002",
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = results_questionnaire
+                    at.run()
+
+        self.assertEqual(len(at.selectbox), 1)
+        inspector_selectbox = at.selectbox[0]
+        self.assertEqual(inspector_selectbox.label, "Question ID")
+        self.assertEqual(list(inspector_selectbox.options), ["Q01", "Q02"])
+        self.assertEqual(inspector_selectbox.value, "Q01")
+
+        markdown_values = [markdown.value for markdown in at.markdown]
+        caption_values = [caption.value for caption in at.caption]
+        self.assertTrue(any("Question Inspector" in value for value in markdown_values))
+        self.assertTrue(
+            any("Is customer data encrypted at rest?" in value for value in markdown_values)
+        )
+        self.assertTrue(
+            any(
+                "Yes. Customer data is encrypted at rest using AES-256 controls." in value
+                for value in markdown_values
+            )
+        )
+        self.assertTrue(
+            any(
+                "Validated against the policy control language." in value
+                for value in markdown_values
+            )
+        )
+        self.assertTrue(
+            any("Ready for Review" in value for value in markdown_values)
+        )
+        self.assertTrue(
+            any("Encryption Policy - Data at Rest" in value for value in markdown_values)
+        )
+        self.assertTrue(
+            any(
+                "Customer data at rest is encrypted using AES-256." in value
+                for value in markdown_values
+            )
+        )
+        self.assertIn(
+            "Source file: Encryption_Policy.md | Section: Data at Rest",
+            caption_values,
+        )
+
+        inspector_selectbox.set_value("Q02")
+        at.run()
+
+        switched_markdown_values = [markdown.value for markdown in at.markdown]
+        switched_caption_values = [caption.value for caption in at.caption]
+        self.assertTrue(any("Are backups encrypted?" in value for value in switched_markdown_values))
+        self.assertTrue(
+            any(
+                "Partially. Backup encryption covers managed jobs but not every legacy path."
+                in value
+                for value in switched_markdown_values
+            )
+        )
+        self.assertTrue(any("Needs Review" in value for value in switched_markdown_values))
+        self.assertTrue(
+            any(
+                "Confirm the remaining legacy backup scope manually." in value
+                for value in switched_markdown_values
+            )
+        )
+        self.assertTrue(
+            any(
+                "Backup jobs are encrypted in transit and at rest." in value
+                for value in switched_markdown_values
+            )
+        )
+        self.assertIn(
+            "Source file: AcmeCloud_SOC2_Summary.pdf | Page: 4",
+            switched_caption_values,
+        )
 
 
 if __name__ == "__main__":

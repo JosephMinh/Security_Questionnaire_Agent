@@ -30,6 +30,7 @@ from rag import (
     INDEX_ACTION_REUSED,
     REPO_ROOT,
     REQUIRED_ENV_VARS,
+    ResolvedEvidenceCitation,
     RuntimeQuestionnaire,
     STATUS_NEEDS_REVIEW,
     STATUS_READY_FOR_REVIEW,
@@ -44,6 +45,7 @@ from rag import (
 LAST_RUN_ID_KEY = "last_run_id"
 LAST_RUN_QUESTIONNAIRE_KEY = "last_run_questionnaire"
 RESULTS_QUESTIONNAIRE_KEY = "results_questionnaire"
+QUESTION_INSPECTOR_SELECTION_KEY = "question_inspector_selection"
 RUN_BUSY_KEY = "run_busy"
 RUN_ACTION_FEEDBACK_KEY = "run_action_feedback"
 WORKSPACE_BUSY_KEY = "workspace_busy"
@@ -296,6 +298,7 @@ def _clear_run_ui_state() -> None:
     st.session_state.pop(LAST_RUN_ID_KEY, None)
     st.session_state.pop(LAST_RUN_QUESTIONNAIRE_KEY, None)
     st.session_state.pop(RESULTS_QUESTIONNAIRE_KEY, None)
+    st.session_state.pop(QUESTION_INSPECTOR_SELECTION_KEY, None)
     st.session_state.pop(RUN_ACTION_FEEDBACK_KEY, None)
 
 
@@ -480,10 +483,96 @@ def _build_run_feedback(
 
 def _questionnaire_has_results(questionnaire: RuntimeQuestionnaire) -> bool:
     """Return whether any row currently contains visible result data."""
-    return any(
-        str(row["Status"]).strip() or str(row["Answer"]).strip()
-        for row in questionnaire.rows
+    return any(_row_has_visible_results(row) for row in questionnaire.rows)
+
+
+def _row_has_visible_results(row_like: Mapping[str, object]) -> bool:
+    """Return whether one runtime row contains visible reviewer-facing output."""
+    return bool(
+        str(row_like.get("Status", "")).strip()
+        or str(row_like.get("Answer", "")).strip()
     )
+
+
+def _processed_result_rows(
+    questionnaire: RuntimeQuestionnaire,
+) -> tuple[Mapping[str, object], ...]:
+    """Return the processed rows that can be inspected safely."""
+    return tuple(row for row in questionnaire.rows if _row_has_visible_results(row))
+
+
+def _status_badge_markup(status: str) -> str:
+    """Return one compact HTML badge for the current row status."""
+    normalized_status = status.strip() or "Pending"
+    is_ready = normalized_status == STATUS_READY_FOR_REVIEW
+    background_color = "#ecfdf3" if is_ready else "#fff7ed"
+    border_color = "#bbf7d0" if is_ready else "#fed7aa"
+    text_color = "#166534" if is_ready else "#9a3412"
+    return (
+        "<span style="
+        "'display:inline-block;padding:0.18rem 0.6rem;border-radius:999px;"
+        f"background:{background_color};border:1px solid {border_color};"
+        f"color:{text_color};font-weight:600;'>{normalized_status}</span>"
+    )
+
+
+def _citation_provenance_details(citation: ResolvedEvidenceCitation) -> str:
+    """Return one compact provenance line for a resolved citation."""
+    details = [f"Source file: {citation.source}"]
+    if citation.section:
+        details.append(f"Section: {citation.section}")
+    if citation.page is not None:
+        details.append(f"Page: {citation.page}")
+    return " | ".join(details)
+
+
+def _render_question_inspector(questionnaire: RuntimeQuestionnaire) -> None:
+    """Render the reviewer-facing question inspector for processed rows."""
+    processed_rows = _processed_result_rows(questionnaire)
+    if not processed_rows:
+        return
+
+    question_ids = [str(row["Question ID"]) for row in processed_rows]
+    if st.session_state.get(QUESTION_INSPECTOR_SELECTION_KEY) not in question_ids:
+        st.session_state.pop(QUESTION_INSPECTOR_SELECTION_KEY, None)
+
+    st.markdown("**Question Inspector**")
+    selected_question_id = st.selectbox(
+        "Question ID",
+        question_ids,
+        key=QUESTION_INSPECTOR_SELECTION_KEY,
+        width="stretch",
+    )
+    selected_row = next(
+        row for row in processed_rows if str(row["Question ID"]) == selected_question_id
+    )
+
+    question_column, details_column = st.columns((1.55, 1.0))
+    with question_column:
+        st.markdown("**Question**")
+        st.markdown(str(selected_row["Question"]))
+        st.markdown("**Drafted Answer**")
+        st.markdown(str(selected_row["Answer"]) or "No drafted answer is available yet.")
+        st.markdown("**Exact Evidence Snippets**")
+        citations = tuple(
+            citation
+            for citation in selected_row.get("citations", ())
+            if isinstance(citation, ResolvedEvidenceCitation)
+        )
+        if not citations:
+            st.info("No validated evidence snippets were attached to this row.")
+        for citation in citations:
+            st.markdown(f"**{citation.display_label or 'Evidence snippet'}**")
+            st.caption(_citation_provenance_details(citation))
+            st.markdown(f"```text\n{citation.snippet_text}\n```")
+
+    with details_column:
+        st.markdown("**Review Details**")
+        st.markdown(f"**Confidence Band:** {str(selected_row['Confidence'])}")
+        st.markdown("**Status**")
+        st.markdown(_status_badge_markup(str(selected_row["Status"])), unsafe_allow_html=True)
+        st.markdown("**Reviewer Note**")
+        st.markdown(str(selected_row["Reviewer Notes"]))
 
 
 def _render_results_surface(
@@ -523,7 +612,10 @@ def _render_results_surface(
         }
         for row in questionnaire.rows
     ]
-    table_placeholder.dataframe(table_rows, hide_index=True, width="stretch")
+    with table_placeholder.container():
+        st.dataframe(table_rows, hide_index=True, width="stretch")
+        if not _run_busy():
+            _render_question_inspector(questionnaire)
 
 
 def _render_idle_run_state(
@@ -880,6 +972,12 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
                 )
         finally:
             st.session_state[RUN_BUSY_KEY] = False
+        _render_results_surface(
+            workspace_snapshot,
+            questionnaire=_results_questionnaire(),
+            summary_placeholder=results_summary_placeholder,
+            table_placeholder=results_table_placeholder,
+        )
 
     _render_feedback(st.session_state.get(RUN_ACTION_FEEDBACK_KEY))
 
