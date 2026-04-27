@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from shlex import join as shell_join
+import tempfile
 from typing import Any, Callable, Final, Mapping, Sequence
 
 from openpyxl import Workbook, load_workbook
@@ -411,6 +412,20 @@ class RuntimeQuestionnaire:
             self.rows,
             columns=(*self.visible_columns, *internal_columns),
         )
+
+
+@dataclass(frozen=True)
+class PublishedExportPacket:
+    """One coherently published export packet for a completed questionnaire run."""
+
+    output_dir: Path
+    answered_questionnaire_path: Path
+    review_summary_path: Path
+    needs_review_csv_path: Path
+    run_id: str
+    completed_at: str
+    workspace_hash: str
+    index_action: str
 
 
 @dataclass(frozen=True)
@@ -2916,6 +2931,117 @@ def write_needs_review_csv(
     return output_path
 
 
+def validate_completed_run_for_export(
+    questionnaire: RuntimeQuestionnaire,
+) -> tuple[str, str]:
+    """Validate that every row belongs to one coherent completed run before publish."""
+    if not questionnaire.rows:
+        raise ValueError("questionnaire must include at least one row to export.")
+
+    run_ids = {str(row["run_id"]).strip() for row in questionnaire.rows}
+    if "" in run_ids:
+        raise ValueError("every questionnaire row must include a non-empty run_id.")
+    if len(run_ids) != 1:
+        raise ValueError("questionnaire rows must share exactly one run_id.")
+
+    index_actions = {str(row["index_action"]).strip() for row in questionnaire.rows}
+    if "" in index_actions:
+        raise ValueError("every questionnaire row must include a non-empty index_action.")
+    if len(index_actions) != 1:
+        raise ValueError("questionnaire rows must share exactly one index_action.")
+
+    for row in questionnaire.rows:
+        if not str(row["answer"]).strip():
+            raise ValueError(
+                f"{row['question_id']} is missing a completed answer for export publish."
+            )
+        if not str(row["confidence_band"]).strip():
+            raise ValueError(
+                f"{row['question_id']} is missing a confidence band for export publish."
+            )
+        if not str(row["status"]).strip():
+            raise ValueError(
+                f"{row['question_id']} is missing a review status for export publish."
+            )
+
+    return next(iter(run_ids)), next(iter(index_actions))
+
+
+def _safe_filesystem_token(value: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in value
+    )
+
+
+def publish_export_packet(
+    questionnaire: RuntimeQuestionnaire,
+    *,
+    output_dir: Path | None = None,
+    completed_at: str | None = None,
+    workspace_hash: str | None = None,
+) -> PublishedExportPacket:
+    """Stage and publish the export packet only from one coherent completed run."""
+    run_id, index_action = validate_completed_run_for_export(questionnaire)
+    resolved_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
+    resolved_output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    completed_timestamp = completed_run_timestamp(completed_at)
+    resolved_workspace_hash = (
+        current_workspace_hash() if workspace_hash is None else workspace_hash.strip()
+    )
+    if not resolved_workspace_hash:
+        raise ValueError("workspace_hash must be a non-empty string.")
+
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=(
+                f".{resolved_output_dir.name}-staging-"
+                f"{_safe_filesystem_token(run_id)}-"
+            ),
+            dir=resolved_output_dir.parent,
+        )
+    )
+    write_answered_questionnaire(questionnaire, output_dir=staging_dir)
+    write_review_summary(
+        questionnaire,
+        output_dir=staging_dir,
+        completed_at=completed_timestamp,
+        workspace_hash=resolved_workspace_hash,
+        index_action=index_action,
+    )
+    write_needs_review_csv(questionnaire, output_dir=staging_dir)
+
+    backup_dir: Path | None = None
+    if resolved_output_dir.exists():
+        backup_dir = resolved_output_dir.parent / (
+            f".{resolved_output_dir.name}-backup-"
+            f"{_safe_filesystem_token(run_id)}-"
+            f"{_safe_filesystem_token(completed_timestamp)}"
+        )
+        if backup_dir.exists():
+            raise FileExistsError(f"Backup output directory already exists at {backup_dir}.")
+        os.replace(resolved_output_dir, backup_dir)
+
+    try:
+        os.replace(staging_dir, resolved_output_dir)
+    except Exception:
+        if backup_dir is not None and backup_dir.exists():
+            os.replace(backup_dir, resolved_output_dir)
+        raise
+
+    return PublishedExportPacket(
+        output_dir=resolved_output_dir,
+        answered_questionnaire_path=answered_questionnaire_output_path(resolved_output_dir),
+        review_summary_path=review_summary_output_path(resolved_output_dir),
+        needs_review_csv_path=needs_review_output_path(resolved_output_dir),
+        run_id=run_id,
+        completed_at=completed_timestamp,
+        workspace_hash=resolved_workspace_hash,
+        index_action=index_action,
+    )
+
+
 def prepare_questionnaire_run(
     questionnaire: RuntimeQuestionnaire,
 ) -> RuntimeQuestionnaire:
@@ -3265,6 +3391,7 @@ __all__ = [
     "OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES",
     "OUTPUTS_DIR",
     "PARTIAL_SCORE",
+    "PublishedExportPacket",
     "QUESTIONNAIRE_FILE_NAME",
     "QUESTION_SHEET_NAME",
     "QUICK_CONFIDENCE_COMMAND_NAMES",
@@ -3345,6 +3472,7 @@ __all__ = [
     "normalize_evidence_text",
     "persist_curated_evidence_chunks",
     "persist_evidence_chunks",
+    "publish_export_packet",
     "prepare_questionnaire_run",
     "question_order_index",
     "rebuild_curated_evidence_index",
@@ -3364,6 +3492,7 @@ __all__ = [
     "score_answer_confidence",
     "update_row_with_answer_result",
     "validate_answer_payload",
+    "validate_completed_run_for_export",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
     "write_answered_questionnaire",

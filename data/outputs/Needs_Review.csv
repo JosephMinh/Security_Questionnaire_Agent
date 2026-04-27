@@ -1,4 +1,5 @@
 Question ID,Category,Question,Answer,Confidence,Status,Reviewer Notes
 Q02,Encryption,Is customer data encrypted in transit over public networks?,Not stated.,Low,Needs Review,Transit-encryption coverage is not explicit in the bundled evidence.
+Q05,Access Control,Is role-based access control used for internal systems?,Not stated.,Low,Needs Review,Centralized key-rotation evidence is incomplete in the curated bundle.
 Q11,Backup & Recovery,Are production backups performed daily?,Not stated.,Low,Needs Review,Retention duration is not stated in the curated evidence set.
 Q22,Security Testing,Do you perform annual external penetration testing?,Not stated.,Low,Needs Review,The bundled evidence does not include the latest external penetration test report.
