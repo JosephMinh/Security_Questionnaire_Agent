@@ -15,6 +15,7 @@ from openpyxl import load_workbook
 from rag import (
     CHROMA_DIR,
     DATA_DIR,
+    ENCRYPTION_POLICY_FILE_NAME,
     EXPECTED_EVIDENCE_FILE_NAMES,
     EXPECTED_QUESTION_IDS,
     MANIFEST_FILE_NAME,
@@ -518,6 +519,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ENCRYPTION_POLICY_FILE_NAME",
     "MANIFEST_FILE_NAME",
     "RUNTIME_DIRECTORIES",
     "SEED_TO_RUNTIME_PATHS",
