@@ -140,6 +140,12 @@ ANSWER_RESPONSE_JSON_SCHEMA: Final[dict[str, object]] = {
     },
     "required": list(ANSWER_OUTPUT_KEYS),
 }
+ANSWER_PAYLOAD_OUTCOME_ACCEPTED: Final[str] = "accepted"
+ANSWER_PAYLOAD_OUTCOME_ACCEPTED_WITH_CITATION_IDS_REMOVED: Final[str] = (
+    "accepted_with_citation_ids_removed"
+)
+ANSWER_PAYLOAD_OUTCOME_REJECTED: Final[str] = "rejected"
+FALLBACK_REVIEWER_NOTE: Final[str] = "Model response requires manual review."
 
 INDEX_ACTION_CREATED: Final[str] = "created"
 INDEX_ACTION_REUSED: Final[str] = "reused"
@@ -466,6 +472,20 @@ class ChromaIndexStatus:
     ready: bool
     reason: str
     collection_handle: ChromaCollectionHandle | None = None
+
+
+@dataclass(frozen=True)
+class AnswerPayloadValidationResult:
+    """Report whether one model payload is safe for later pipeline stages."""
+
+    usable: bool
+    outcome: str
+    reviewer_note: str
+    answer: str | None = None
+    answer_type: str | None = None
+    citation_ids: tuple[str, ...] = ()
+    invalid_citation_ids: tuple[str, ...] = ()
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2047,6 +2067,105 @@ def generate_answer_payload(
     return payload
 
 
+def _reviewer_note_with_fallback(raw_value: object) -> str:
+    """Return a short reviewer-oriented note, using a safe fallback when blank."""
+    if isinstance(raw_value, str):
+        normalized_value = raw_value.strip()
+        if normalized_value:
+            return normalized_value
+    return FALLBACK_REVIEWER_NOTE
+
+
+def validate_answer_payload(
+    payload: Mapping[str, object],
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+) -> AnswerPayloadValidationResult:
+    """Validate one raw answer payload and drop citations outside the retrieved set."""
+    payload_keys = set(payload.keys())
+    required_keys = set(ANSWER_OUTPUT_KEYS)
+    if payload_keys != required_keys:
+        return AnswerPayloadValidationResult(
+            usable=False,
+            outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+            reviewer_note=FALLBACK_REVIEWER_NOTE,
+            failure_reason="payload_shape_invalid",
+        )
+
+    answer = payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return AnswerPayloadValidationResult(
+            usable=False,
+            outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+            reviewer_note=_reviewer_note_with_fallback(payload.get("reviewer_note")),
+            failure_reason="answer_invalid",
+        )
+
+    answer_type = payload.get("answer_type")
+    if not isinstance(answer_type, str) or answer_type not in ANSWER_TYPES:
+        return AnswerPayloadValidationResult(
+            usable=False,
+            outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+            reviewer_note=_reviewer_note_with_fallback(payload.get("reviewer_note")),
+            failure_reason="answer_type_invalid",
+        )
+
+    raw_citation_ids = payload.get("citation_ids")
+    if not isinstance(raw_citation_ids, list):
+        return AnswerPayloadValidationResult(
+            usable=False,
+            outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+            reviewer_note=_reviewer_note_with_fallback(payload.get("reviewer_note")),
+            failure_reason="citation_ids_invalid",
+        )
+
+    retrieved_chunk_ids = {chunk.chunk_id for chunk in retrieved_chunks}
+    valid_citation_ids: list[str] = []
+    invalid_citation_ids: list[str] = []
+    for raw_citation_id in raw_citation_ids:
+        if not isinstance(raw_citation_id, str) or not raw_citation_id.strip():
+            return AnswerPayloadValidationResult(
+                usable=False,
+                outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+                reviewer_note=_reviewer_note_with_fallback(payload.get("reviewer_note")),
+                failure_reason="citation_ids_invalid",
+            )
+
+        citation_id = raw_citation_id.strip()
+        if citation_id in retrieved_chunk_ids:
+            if citation_id not in valid_citation_ids:
+                valid_citation_ids.append(citation_id)
+            continue
+        invalid_citation_ids.append(citation_id)
+
+    reviewer_note = _reviewer_note_with_fallback(payload.get("reviewer_note"))
+    if answer_type != ANSWER_TYPE_UNSUPPORTED and not valid_citation_ids:
+        return AnswerPayloadValidationResult(
+            usable=False,
+            outcome=ANSWER_PAYLOAD_OUTCOME_REJECTED,
+            reviewer_note=reviewer_note,
+            answer=answer.strip(),
+            answer_type=answer_type,
+            citation_ids=(),
+            invalid_citation_ids=tuple(invalid_citation_ids),
+            failure_reason="no_valid_citations",
+        )
+
+    outcome = (
+        ANSWER_PAYLOAD_OUTCOME_ACCEPTED_WITH_CITATION_IDS_REMOVED
+        if invalid_citation_ids
+        else ANSWER_PAYLOAD_OUTCOME_ACCEPTED
+    )
+    return AnswerPayloadValidationResult(
+        usable=True,
+        outcome=outcome,
+        reviewer_note=reviewer_note,
+        answer=answer.strip(),
+        answer_type=answer_type,
+        citation_ids=tuple(valid_citation_ids),
+        invalid_citation_ids=tuple(invalid_citation_ids),
+    )
+
+
 def retrieve_evidence_chunks(
     question_text: str,
     *,
@@ -2368,6 +2487,9 @@ __all__ = [
     "ACCESS_CONTROL_POLICY_FILE_NAME",
     "ANSWER_OPENING_TOKENS",
     "ANSWER_OUTPUT_KEYS",
+    "ANSWER_PAYLOAD_OUTCOME_ACCEPTED",
+    "ANSWER_PAYLOAD_OUTCOME_ACCEPTED_WITH_CITATION_IDS_REMOVED",
+    "ANSWER_PAYLOAD_OUTCOME_REJECTED",
     "ANSWER_RESPONSE_JSON_SCHEMA",
     "ANSWER_RESPONSE_SCHEMA_NAME",
     "ANSWER_TYPE_PARTIAL",
@@ -2377,6 +2499,7 @@ __all__ = [
     "ANSWERED_QUESTIONNAIRE_FILE_NAME",
     "APP_SUBTITLE",
     "APP_TITLE",
+    "AnswerPayloadValidationResult",
     "BACKUP_RECOVERY_POLICY_FILE_NAME",
     "CANONICAL_VERIFICATION_COMMANDS",
     "CHROMA_DIR",
@@ -2408,6 +2531,7 @@ __all__ = [
     "EXPECTED_EVIDENCE_FILE_NAMES",
     "EXPECTED_QUESTION_IDS",
     "FAIL_CLOSED_SCORE",
+    "FALLBACK_REVIEWER_NOTE",
     "FULL_LOCAL_VALIDATION_COMMAND_NAMES",
     "HIGH_CONFIDENCE_THRESHOLD",
     "INCIDENT_RESPONSE_POLICY_FILE_NAME",
@@ -2533,6 +2657,7 @@ __all__ = [
     "runtime_evidence_directory",
     "runtime_manifest_path",
     "runtime_questionnaire_path",
+    "validate_answer_payload",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
 ]
