@@ -503,6 +503,15 @@ class AnswerPayloadValidationResult:
 
 
 @dataclass(frozen=True)
+class AnswerConfidenceResult:
+    """One deterministic confidence assessment for a validated or fail-closed row."""
+
+    confidence_score: float
+    confidence_band: str
+    status: str
+
+
+@dataclass(frozen=True)
 class VerificationCommand:
     """One canonical verification command and the conditions around it."""
 
@@ -877,6 +886,44 @@ def confidence_band_for_score(confidence_score: float) -> str:
     if confidence_score >= MEDIUM_CONFIDENCE_THRESHOLD:
         return CONFIDENCE_BAND_MEDIUM
     return CONFIDENCE_BAND_LOW
+
+
+def review_status_for_score(confidence_score: float) -> str:
+    """Map a numeric confidence score into the planned review status."""
+    if confidence_score >= REVIEW_QUEUE_THRESHOLD:
+        return STATUS_READY_FOR_REVIEW
+    return STATUS_NEEDS_REVIEW
+
+
+def score_answer_confidence(
+    answer_type: str,
+    *,
+    valid_citation_count: int,
+) -> AnswerConfidenceResult:
+    """Score one validated answer type and citation count using the planned rules."""
+    if answer_type not in ANSWER_TYPES:
+        raise ValueError(f"Unsupported answer_type {answer_type!r} for scoring.")
+    if valid_citation_count < 0:
+        raise ValueError("valid_citation_count must be zero or greater.")
+
+    if valid_citation_count == 0:
+        confidence_score = FAIL_CLOSED_SCORE
+    elif answer_type == ANSWER_TYPE_SUPPORTED:
+        confidence_score = (
+            SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE
+            if valid_citation_count >= 2
+            else SUPPORTED_WITH_ONE_CITATION_SCORE
+        )
+    elif answer_type == ANSWER_TYPE_PARTIAL:
+        confidence_score = PARTIAL_SCORE
+    else:
+        confidence_score = UNSUPPORTED_SCORE
+
+    return AnswerConfidenceResult(
+        confidence_score=confidence_score,
+        confidence_band=confidence_band_for_score(confidence_score),
+        status=review_status_for_score(confidence_score),
+    )
 
 
 def build_evidence_display_value(display_labels: Sequence[str]) -> str:
@@ -2564,6 +2611,7 @@ __all__ = [
     "ANSWERED_QUESTIONNAIRE_FILE_NAME",
     "APP_SUBTITLE",
     "APP_TITLE",
+    "AnswerConfidenceResult",
     "AnswerPayloadValidationResult",
     "BACKUP_RECOVERY_POLICY_FILE_NAME",
     "CANONICAL_VERIFICATION_COMMANDS",
@@ -2720,10 +2768,12 @@ __all__ = [
     "retrieve_evidence_chunks_for_row",
     "resolve_validated_citations",
     "review_priority_sort_key",
+    "review_status_for_score",
     "RuntimeQuestionnaire",
     "runtime_evidence_directory",
     "runtime_manifest_path",
     "runtime_questionnaire_path",
+    "score_answer_confidence",
     "validate_answer_payload",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
