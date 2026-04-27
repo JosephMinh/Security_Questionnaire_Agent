@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 import rag
@@ -44,6 +45,15 @@ def _ready_index_status(
 
 class RagRetrievalTest(unittest.TestCase):
     """Verify retrieval stays bounded, deduplicated, and prompt-ready."""
+
+    def _expected_fixture_question(self, question_id: str) -> dict[str, object]:
+        """Return one canonical expected-outcomes row by question id."""
+        fixture_path = rag.SEED_QUESTIONNAIRE_DIR / "Demo_Security_Questionnaire.expected.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for question in fixture["questions"]:
+            if question["question_id"] == question_id:
+                return dict(question)
+        raise AssertionError(f"Question {question_id!r} was not found in the expected fixture.")
 
     def test_retrieve_evidence_chunks_dedupes_and_preserves_relevance_order(self):
         """Duplicate logical chunk ids should collapse while later unique hits still surface."""
@@ -207,6 +217,168 @@ class RagRetrievalTest(unittest.TestCase):
             )
 
         self.assertIn("logical chunk id", str(context.exception))
+
+    def test_retrieve_evidence_chunks_caps_at_five_unique_results(self):
+        """Default retrieval should stop at five unique logical chunks in relevance order."""
+        collection = _FakeCollection(
+            {
+                "ids": [[
+                    "enc_001-hit-a",
+                    "enc_001-hit-b",
+                    "acc_001-hit",
+                    "ir_001-hit",
+                    "bkp_001-hit",
+                    "soc2_001-hit",
+                    "enc_003-hit",
+                ]],
+                "documents": [[
+                    "Encryption evidence primary.",
+                    "Encryption evidence duplicate.",
+                    "Access review evidence.",
+                    "Incident response evidence.",
+                    "Backup evidence.",
+                    "SOC 2 evidence.",
+                    "Lower-ranked encryption evidence.",
+                ]],
+                "metadatas": [[
+                    {
+                        "chunk_id": "enc_001",
+                        "source": rag.ENCRYPTION_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Data at Rest",
+                        "page": None,
+                    },
+                    {
+                        "chunk_id": "enc_001",
+                        "source": rag.ENCRYPTION_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Data at Rest",
+                        "page": None,
+                    },
+                    {
+                        "chunk_id": "acc_001",
+                        "source": rag.ACCESS_CONTROL_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Access Reviews",
+                        "page": None,
+                    },
+                    {
+                        "chunk_id": "ir_001",
+                        "source": rag.INCIDENT_RESPONSE_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Incident Triage Timeline",
+                        "page": None,
+                    },
+                    {
+                        "chunk_id": "bkp_001",
+                        "source": rag.BACKUP_RECOVERY_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Backup Frequency",
+                        "page": None,
+                    },
+                    {
+                        "chunk_id": "soc2_001",
+                        "source": rag.SOC2_SUMMARY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_PDF,
+                        "section": None,
+                        "page": 1,
+                    },
+                    {
+                        "chunk_id": "enc_003",
+                        "source": rag.ENCRYPTION_POLICY_FILE_NAME,
+                        "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                        "section": "Centralized Key Management",
+                        "page": None,
+                    },
+                ]],
+                "distances": [[0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07]],
+            }
+        )
+        index_status = _ready_index_status(collection, actual_chunk_count=7)
+
+        retrieved = rag.retrieve_evidence_chunks(
+            "Which five evidence chunks should reach the model?",
+            index_status=index_status,
+        )
+
+        self.assertEqual(collection.query_calls[0]["n_results"], 7)
+        self.assertEqual(
+            [chunk.chunk_id for chunk in retrieved],
+            ["enc_001", "acc_001", "ir_001", "bkp_001", "soc2_001"],
+        )
+        self.assertEqual([chunk.rank for chunk in retrieved], [1, 2, 3, 4, 5])
+        self.assertEqual(len(retrieved), 5)
+
+    def test_retrieve_evidence_chunks_for_row_preserves_fixture_primary_source_anchors(self):
+        """Representative fixture rows should keep the expected primary source visible first."""
+        cases = ("Q01", "Q14")
+        for question_id in cases:
+            with self.subTest(question_id=question_id):
+                question = self._expected_fixture_question(question_id)
+                primary_source = str(question["primary_source"])
+                anchor_hint = str(question["anchor_hint"])
+                primary_doc_type = (
+                    rag.DOCUMENT_TYPE_PDF
+                    if primary_source.endswith(".pdf")
+                    else rag.DOCUMENT_TYPE_POLICY
+                )
+                primary_section = None if primary_doc_type == rag.DOCUMENT_TYPE_PDF else anchor_hint
+                primary_page = 1 if primary_doc_type == rag.DOCUMENT_TYPE_PDF else None
+
+                collection = _FakeCollection(
+                    {
+                        "ids": [["primary-hit", "secondary-hit"]],
+                        "documents": [[
+                            f"{anchor_hint}: evidence text for {question_id}.",
+                            "Secondary supporting evidence.",
+                        ]],
+                        "metadatas": [[
+                            {
+                                "chunk_id": f"{question_id.lower()}_primary",
+                                "source": primary_source,
+                                "doc_type": primary_doc_type,
+                                "section": primary_section,
+                                "page": primary_page,
+                            },
+                            {
+                                "chunk_id": f"{question_id.lower()}_secondary",
+                                "source": rag.ACCESS_CONTROL_POLICY_FILE_NAME,
+                                "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                                "section": "Secondary Evidence",
+                                "page": None,
+                            },
+                        ]],
+                        "distances": [[0.01, 0.09]],
+                    }
+                )
+                index_status = _ready_index_status(collection, actual_chunk_count=2)
+
+                retrieved = rag.retrieve_evidence_chunks_for_row(
+                    {
+                        "Question ID": question_id,
+                        "Question": str(question["question"]),
+                    },
+                    index_status=index_status,
+                    top_k=2,
+                )
+
+                self.assertEqual(
+                    collection.query_calls[0]["query_texts"],
+                    [str(question["question"])],
+                )
+                self.assertEqual(retrieved[0].source, primary_source)
+                self.assertIn(anchor_hint, retrieved[0].text)
+                self.assertEqual(retrieved[0].source_path, rag.RUNTIME_EVIDENCE_DIR / primary_source)
+                self.assertEqual(
+                    retrieved[0].metadata(),
+                    {
+                        "chunk_id": f"{question_id.lower()}_primary",
+                        "source": primary_source,
+                        "doc_type": primary_doc_type,
+                        "section": primary_section,
+                        "page": primary_page,
+                    },
+                )
 
 
 if __name__ == "__main__":
