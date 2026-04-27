@@ -127,8 +127,9 @@ class AppRunSectionTest(unittest.TestCase):
 
         with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
             with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
-                at = AppTest.from_function(_run_app_main)
-                at.run()
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.run()
 
         self.assertIn("Run Copilot", [button.label for button in at.button])
         self.assertEqual(len(at.metric), 1)
@@ -232,23 +233,24 @@ class AppRunSectionTest(unittest.TestCase):
 
         with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
             with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
-                with patch.object(
-                    app,
-                    "ensure_curated_evidence_index",
-                    return_value=_ready_index_status(),
-                ):
-                    with patch.object(app, "_new_run_id", return_value="demo-run-001"):
-                        with patch.object(
-                            app,
-                            "run_questionnaire_answer_pipeline",
-                            side_effect=fake_run_pipeline,
-                        ):
-                            at = AppTest.from_function(_run_app_main)
-                            at.run()
-                            next(
-                                button for button in at.button if button.label == "Run Copilot"
-                            ).click()
-                            at.run()
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    with patch.object(
+                        app,
+                        "ensure_curated_evidence_index",
+                        return_value=_ready_index_status(),
+                    ):
+                        with patch.object(app, "_new_run_id", return_value="demo-run-001"):
+                            with patch.object(
+                                app,
+                                "run_questionnaire_answer_pipeline",
+                                side_effect=fake_run_pipeline,
+                            ):
+                                at = AppTest.from_function(_run_app_main)
+                                at.run()
+                                next(
+                                    button for button in at.button if button.label == "Run Copilot"
+                                ).click()
+                                at.run()
 
         self.assertEqual(
             callback_events,
@@ -311,6 +313,89 @@ class AppRunSectionTest(unittest.TestCase):
         self.assertTrue(
             any("Copilot run finished." in success.value for success in at.success)
         )
+
+    def test_run_section_blocks_when_required_environment_is_missing(self) -> None:
+        """Missing provider configuration should disable the run path with guidance."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(
+                    app,
+                    "_missing_required_environment",
+                    return_value=("OPENAI_API_KEY",),
+                ):
+                    at = AppTest.from_function(_run_app_main)
+                    at.run()
+
+        run_button = next(button for button in at.button if button.label == "Run Copilot")
+        self.assertTrue(run_button.disabled)
+        self.assertIn(
+            "Set OPENAI_API_KEY in the shell or repo-local `.env` before running the copilot.",
+            [caption.value for caption in at.caption],
+        )
+
+    def test_load_demo_workspace_clears_stale_results_surface(self) -> None:
+        """Workspace reload should clear prior run results instead of leaving stale tables."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            ),
+            _runtime_row(
+                question_id="Q02",
+                category="Backups",
+                question="Are backups encrypted?",
+            ),
+        )
+        stale_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        stale_questionnaire.rows[0] = rag.update_row_with_answer_result(
+            stale_questionnaire.rows[0],
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_ONE_CITATION_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="stale-run",
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    with patch.object(app, "prepare_demo_workspace", return_value=()):
+                        with patch.object(
+                            app,
+                            "ensure_curated_evidence_index",
+                            return_value=_ready_index_status(),
+                        ):
+                            at = AppTest.from_function(_run_app_main)
+                            at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = stale_questionnaire
+                            at.session_state[app.LAST_RUN_ID_KEY] = "stale-run"
+                            at.session_state[app.LAST_RUN_QUESTIONNAIRE_KEY] = stale_questionnaire
+                            at.run()
+                            self.assertEqual(len(at.dataframe), 1)
+                            next(
+                                button for button in at.button if button.label == "Load Demo Workspace"
+                            ).click()
+                            at.run()
+
+        self.assertEqual(len(at.dataframe), 0)
+        self.assertIn(
+            "Results will populate here as questions finish processing.",
+            [info.value for info in at.info],
+        )
+        self.assertNotIn(app.RESULTS_QUESTIONNAIRE_KEY, at.session_state)
+        self.assertNotIn(app.LAST_RUN_ID_KEY, at.session_state)
 
 
 if __name__ == "__main__":

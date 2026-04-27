@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 from uuid import uuid4
 
 import streamlit as st
@@ -27,6 +28,8 @@ from rag import (
     INDEX_ACTION_REBUILT_CONTENT_CHANGE,
     INDEX_ACTION_REBUILT_INTEGRITY,
     INDEX_ACTION_REUSED,
+    REPO_ROOT,
+    REQUIRED_ENV_VARS,
     RuntimeQuestionnaire,
     STATUS_NEEDS_REVIEW,
     STATUS_READY_FOR_REVIEW,
@@ -41,7 +44,9 @@ from rag import (
 LAST_RUN_ID_KEY = "last_run_id"
 LAST_RUN_QUESTIONNAIRE_KEY = "last_run_questionnaire"
 RESULTS_QUESTIONNAIRE_KEY = "results_questionnaire"
+RUN_BUSY_KEY = "run_busy"
 RUN_ACTION_FEEDBACK_KEY = "run_action_feedback"
+WORKSPACE_BUSY_KEY = "workspace_busy"
 WORKSPACE_ACTION_FEEDBACK_KEY = "workspace_action_feedback"
 
 INDEX_ACTION_LABELS = {
@@ -286,6 +291,14 @@ def _persist_run_feedback(feedback: ActionFeedback) -> None:
     st.session_state[RUN_ACTION_FEEDBACK_KEY] = feedback
 
 
+def _clear_run_ui_state() -> None:
+    """Remove stale run outputs, ids, and feedback after a workflow transition."""
+    st.session_state.pop(LAST_RUN_ID_KEY, None)
+    st.session_state.pop(LAST_RUN_QUESTIONNAIRE_KEY, None)
+    st.session_state.pop(RESULTS_QUESTIONNAIRE_KEY, None)
+    st.session_state.pop(RUN_ACTION_FEEDBACK_KEY, None)
+
+
 def _clear_last_run() -> None:
     """Remove any persisted questionnaire results from a prior run."""
     st.session_state.pop(LAST_RUN_ID_KEY, None)
@@ -314,6 +327,35 @@ def _results_questionnaire() -> RuntimeQuestionnaire | None:
     if isinstance(questionnaire, RuntimeQuestionnaire):
         return questionnaire
     return None
+
+
+def _workspace_busy() -> bool:
+    """Return whether one workspace action is currently running."""
+    return bool(st.session_state.get(WORKSPACE_BUSY_KEY, False))
+
+
+def _run_busy() -> bool:
+    """Return whether one questionnaire run is currently running."""
+    return bool(st.session_state.get(RUN_BUSY_KEY, False))
+
+
+def _load_repo_env_if_available() -> None:
+    """Load repo-local `.env` values before checking required runtime variables."""
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        return
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
+
+def _missing_required_environment() -> tuple[str, ...]:
+    """Return the missing runtime environment variables needed for the run button."""
+    _load_repo_env_if_available()
+    return tuple(
+        variable_name
+        for variable_name in REQUIRED_ENV_VARS
+        if not os.getenv(variable_name, "").strip()
+    )
 
 
 def _new_run_id() -> str:
@@ -386,6 +428,15 @@ def _build_run_section_state(snapshot: WorkspaceSnapshot) -> RunSectionState:
     total_questions = len(questionnaire.rows) if questionnaire is not None else 0
     if questionnaire is not None and total_questions == 0:
         readiness_lines.append("The runtime questionnaire does not contain any answerable rows.")
+        can_run = False
+
+    missing_environment = _missing_required_environment()
+    if missing_environment:
+        readiness_lines.append(
+            "Set "
+            + ", ".join(missing_environment)
+            + " in the shell or repo-local `.env` before running the copilot."
+        )
         can_run = False
 
     if questionnaire is not None and snapshot.validation_ok and not snapshot.index_ready:
@@ -707,29 +758,46 @@ def render_workspace_section() -> WorkspaceSnapshot:
         "Prepare the curated runtime workspace, reuse the local evidence index when the "
         "manifest matches, and surface actionable recovery text when something drifts."
     )
+    actions_locked = _workspace_busy() or _run_busy()
 
     load_clicked = st.button(
         "Load Demo Workspace",
         type="primary",
         width="stretch",
+        disabled=actions_locked,
     )
     with st.expander("Advanced"):
         st.caption(
             "Recovery-only controls. Use these when you need to rebuild the local index "
             "or reset the curated demo workspace."
         )
-        rebuild_clicked = st.button("Rebuild Index", width="stretch")
-        reset_clicked = st.button("Reset Demo", width="stretch")
+        rebuild_clicked = st.button("Rebuild Index", width="stretch", disabled=actions_locked)
+        reset_clicked = st.button("Reset Demo", width="stretch", disabled=actions_locked)
 
     if load_clicked:
-        with st.spinner("Preparing the demo workspace and ensuring the local index is ready..."):
-            _persist_feedback(_load_demo_workspace_feedback(reset_index=False))
+        st.session_state[WORKSPACE_BUSY_KEY] = True
+        _clear_run_ui_state()
+        try:
+            with st.spinner("Preparing the demo workspace and ensuring the local index is ready..."):
+                _persist_feedback(_load_demo_workspace_feedback(reset_index=False))
+        finally:
+            st.session_state[WORKSPACE_BUSY_KEY] = False
     elif rebuild_clicked:
-        with st.spinner("Rebuilding the local evidence index..."):
-            _persist_feedback(_rebuild_index_feedback())
+        st.session_state[WORKSPACE_BUSY_KEY] = True
+        _clear_run_ui_state()
+        try:
+            with st.spinner("Rebuilding the local evidence index..."):
+                _persist_feedback(_rebuild_index_feedback())
+        finally:
+            st.session_state[WORKSPACE_BUSY_KEY] = False
     elif reset_clicked:
-        with st.spinner("Resetting the demo workspace and rebuilding the local index..."):
-            _persist_feedback(_load_demo_workspace_feedback(reset_index=True))
+        st.session_state[WORKSPACE_BUSY_KEY] = True
+        _clear_run_ui_state()
+        try:
+            with st.spinner("Resetting the demo workspace and rebuilding the local index..."):
+                _persist_feedback(_load_demo_workspace_feedback(reset_index=True))
+        finally:
+            st.session_state[WORKSPACE_BUSY_KEY] = False
 
     _render_feedback(st.session_state.get(WORKSPACE_ACTION_FEEDBACK_KEY))
     snapshot = _workspace_snapshot()
@@ -751,6 +819,7 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
     )
 
     run_state = _build_run_section_state(workspace_snapshot)
+    actions_locked = _workspace_busy() or _run_busy()
 
     count_column, button_column = st.columns((0.9, 1.3))
     with count_column:
@@ -760,11 +829,13 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
             "Run Copilot",
             type="primary",
             width="stretch",
-            disabled=not run_state.can_run,
+            disabled=not run_state.can_run or actions_locked,
         )
 
     for line in run_state.readiness_lines:
         st.caption(line)
+    if actions_locked:
+        st.caption("Another app action is finishing. Wait for it to complete before starting a new one.")
 
     progress_bar = st.progress(
         0.0,
@@ -792,18 +863,23 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
     )
 
     if run_clicked:
-        with st.spinner("Running the curated questionnaire one row at a time..."):
-            _persist_run_feedback(
-                _run_copilot_feedback(
-                    run_state,
-                    workspace_snapshot=workspace_snapshot,
-                    progress_bar=progress_bar,
-                    progress_summary_placeholder=summary_placeholder,
-                    status_placeholder=status_placeholder,
-                    results_summary_placeholder=results_summary_placeholder,
-                    results_table_placeholder=results_table_placeholder,
+        st.session_state[RUN_BUSY_KEY] = True
+        _clear_run_ui_state()
+        try:
+            with st.spinner("Running the curated questionnaire one row at a time..."):
+                _persist_run_feedback(
+                    _run_copilot_feedback(
+                        run_state,
+                        workspace_snapshot=workspace_snapshot,
+                        progress_bar=progress_bar,
+                        progress_summary_placeholder=summary_placeholder,
+                        status_placeholder=status_placeholder,
+                        results_summary_placeholder=results_summary_placeholder,
+                        results_table_placeholder=results_table_placeholder,
+                    )
                 )
-            )
+        finally:
+            st.session_state[RUN_BUSY_KEY] = False
 
     _render_feedback(st.session_state.get(RUN_ACTION_FEEDBACK_KEY))
 
