@@ -847,6 +847,52 @@ class AppRunSectionTest(unittest.TestCase):
             any(rag.FALLBACK_REVIEWER_NOTE in value for value in markdown_values)
         )
 
+    def test_review_queue_and_inspector_ties_follow_canonical_question_order(self) -> None:
+        """Equal-confidence ties should defer to the shared questionnaire ordering helper."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="A",
+                category="One",
+                question="First synthetic question?",
+            ),
+            _runtime_row(
+                question_id="B",
+                category="Two",
+                question="Second synthetic question?",
+            ),
+            _runtime_row(
+                question_id="C",
+                category="Three",
+                question="Third synthetic question?",
+            ),
+        )
+        results_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        tied_answer = _answer_result(
+            answer="Partially. Manual review is still required.",
+            answer_type=rag.ANSWER_TYPE_PARTIAL,
+            confidence_score=0.70,
+            confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+            status=rag.STATUS_NEEDS_REVIEW,
+            reviewer_note="Tie-break on canonical order.",
+        )
+        for row_index in range(len(results_questionnaire.rows)):
+            results_questionnaire.rows[row_index] = rag.update_row_with_answer_result(
+                results_questionnaire.rows[row_index],
+                tied_answer,
+                index_action=rag.INDEX_ACTION_REUSED,
+                run_id="demo-run-ordering",
+            )
+
+        with patch.object(app, "question_order_index", side_effect={"A": 2, "B": 1, "C": 3}.get):
+            review_queue_rows = app._review_queue_rows(results_questionnaire)
+            default_question_id = app._default_inspector_question_id(results_questionnaire)
+
+        self.assertEqual(
+            [str(row["Question ID"]) for row in review_queue_rows],
+            ["B", "A", "C"],
+        )
+        self.assertEqual(default_question_id, "B")
+
     def test_results_surface_question_inspector_shows_provenance_and_switches_rows(
         self,
     ) -> None:

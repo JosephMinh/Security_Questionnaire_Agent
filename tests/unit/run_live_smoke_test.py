@@ -196,6 +196,33 @@ class RunLiveSmokeScriptTest(unittest.TestCase):
         self.assertEqual(records[0]["status"], rag.LOG_STATUS_SKIPPED)
         self.assertEqual(records[0]["reason"], "missing_openai_api_key")
 
+    def test_reviewer_note_presence_matches_reviewer_visible_row_contract(self) -> None:
+        """Ready rows should not report reviewer notes just because an internal fallback string exists."""
+
+        ready_result = rag.GeneratedAnswerResult(
+            answer="Yes. Encryption at rest is enforced.",
+            answer_type=rag.ANSWER_TYPE_SUPPORTED,
+            citation_ids=("enc_001",),
+            citations=(),
+            confidence_score=rag.SUPPORTED_WITH_ONE_CITATION_SCORE,
+            confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+            status=rag.STATUS_READY_FOR_REVIEW,
+            reviewer_note=rag.FALLBACK_REVIEWER_NOTE,
+        )
+        review_result = rag.GeneratedAnswerResult(
+            answer="Partially. Evidence is narrower than full coverage.",
+            answer_type=rag.ANSWER_TYPE_PARTIAL,
+            citation_ids=("acc_001",),
+            citations=(),
+            confidence_score=rag.PARTIAL_SCORE,
+            confidence_band=rag.CONFIDENCE_BAND_LOW,
+            status=rag.STATUS_NEEDS_REVIEW,
+            reviewer_note="Manual confirmation is still required.",
+        )
+
+        self.assertFalse(self.script._reviewer_note_present(ready_result))
+        self.assertTrue(self.script._reviewer_note_present(review_result))
+
 
 if __name__ == "__main__":
     unittest.main()

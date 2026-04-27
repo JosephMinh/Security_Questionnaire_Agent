@@ -328,6 +328,14 @@ def _ordered_sources(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _reviewer_note_present(result: rag.GeneratedAnswerResult) -> bool:
+    """Return whether one result exposes a reviewer-visible note in the final row contract."""
+    return (
+        result.status == rag.STATUS_NEEDS_REVIEW
+        and bool(result.reviewer_note.strip())
+    )
+
+
 def _run_live_smoke(
     *,
     question_ids: Sequence[str],
@@ -470,7 +478,7 @@ def _run_live_smoke(
                     opening_token=opening_token,
                     retrieved_sources=retrieved_sources,
                     cited_sources=cited_sources,
-                    reviewer_note_present=bool(result.reviewer_note),
+                    reviewer_note_present=_reviewer_note_present(result),
                     failed_closed=result.failed_closed,
                 )
 
