@@ -269,6 +269,34 @@ class AppRunSectionTest(unittest.TestCase):
                 rag.STATUS_READY_FOR_REVIEW,
             ],
         )
+        self.assertEqual(
+            {
+                metric.label: str(metric.value)
+                for metric in at.metric
+            },
+            {
+                "Total Questions": "3",
+                "Questions": "3",
+                "Ready for Review": "2",
+                "Needs Review": "1",
+                "Sources Indexed": "5",
+            },
+        )
+        self.assertEqual(len(at.dataframe), 1)
+        dataframe = at.dataframe[0].value
+        self.assertEqual(
+            list(dataframe.columns),
+            ["Question ID", "Category", "Answer", "Confidence", "Status"],
+        )
+        self.assertEqual(list(dataframe["Question ID"]), ["Q01", "Q02", "Q03"])
+        self.assertEqual(
+            list(dataframe["Status"]),
+            [
+                rag.STATUS_READY_FOR_REVIEW,
+                rag.STATUS_NEEDS_REVIEW,
+                rag.STATUS_READY_FOR_REVIEW,
+            ],
+        )
         self.assertIn(
             "Completed 3 of 3 questions.",
             [caption.value for caption in at.caption],

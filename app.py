@@ -40,6 +40,7 @@ from rag import (
 
 LAST_RUN_ID_KEY = "last_run_id"
 LAST_RUN_QUESTIONNAIRE_KEY = "last_run_questionnaire"
+RESULTS_QUESTIONNAIRE_KEY = "results_questionnaire"
 RUN_ACTION_FEEDBACK_KEY = "run_action_feedback"
 WORKSPACE_ACTION_FEEDBACK_KEY = "workspace_action_feedback"
 
@@ -297,6 +298,24 @@ def _persist_last_run(questionnaire: RuntimeQuestionnaire, *, run_id: str) -> No
     st.session_state[LAST_RUN_QUESTIONNAIRE_KEY] = questionnaire
 
 
+def _clear_results_questionnaire() -> None:
+    """Remove any persisted results-surface questionnaire snapshot."""
+    st.session_state.pop(RESULTS_QUESTIONNAIRE_KEY, None)
+
+
+def _persist_results_questionnaire(questionnaire: RuntimeQuestionnaire) -> None:
+    """Store the most recent partial or completed questionnaire results snapshot."""
+    st.session_state[RESULTS_QUESTIONNAIRE_KEY] = questionnaire
+
+
+def _results_questionnaire() -> RuntimeQuestionnaire | None:
+    """Return the most recent questionnaire snapshot for the results surface."""
+    questionnaire = st.session_state.get(RESULTS_QUESTIONNAIRE_KEY)
+    if isinstance(questionnaire, RuntimeQuestionnaire):
+        return questionnaire
+    return None
+
+
 def _new_run_id() -> str:
     """Return one deterministic-enough run identifier for UI-triggered runs."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -408,6 +427,54 @@ def _build_run_feedback(
     )
 
 
+def _questionnaire_has_results(questionnaire: RuntimeQuestionnaire) -> bool:
+    """Return whether any row currently contains visible result data."""
+    return any(
+        str(row["Status"]).strip() or str(row["Answer"]).strip()
+        for row in questionnaire.rows
+    )
+
+
+def _render_results_surface(
+    workspace_snapshot: WorkspaceSnapshot,
+    *,
+    questionnaire: RuntimeQuestionnaire | None,
+    summary_placeholder: object,
+    table_placeholder: object,
+) -> None:
+    """Render the results cards and the primary table when row output exists."""
+    if questionnaire is None or not _questionnaire_has_results(questionnaire):
+        summary_placeholder.empty()
+        table_placeholder.info("Results will populate here as questions finish processing.")
+        return
+
+    ready_count = sum(
+        str(row["Status"]) == STATUS_READY_FOR_REVIEW for row in questionnaire.rows
+    )
+    needs_review_count = sum(
+        str(row["Status"]) == STATUS_NEEDS_REVIEW for row in questionnaire.rows
+    )
+    with summary_placeholder.container():
+        st.markdown("**Results Overview**")
+        question_column, ready_column, review_column, sources_column = st.columns(4)
+        question_column.metric("Questions", len(questionnaire.rows))
+        ready_column.metric("Ready for Review", ready_count)
+        review_column.metric("Needs Review", needs_review_count)
+        sources_column.metric("Sources Indexed", workspace_snapshot.evidence_present_count)
+
+    table_rows = [
+        {
+            "Question ID": str(row["Question ID"]),
+            "Category": str(row["Category"]),
+            "Answer": str(row["Answer"]),
+            "Confidence": str(row["Confidence"]),
+            "Status": str(row["Status"]),
+        }
+        for row in questionnaire.rows
+    ]
+    table_placeholder.dataframe(table_rows, hide_index=True, width="stretch")
+
+
 def _render_idle_run_state(
     run_state: RunSectionState,
     *,
@@ -465,9 +532,12 @@ def _render_idle_run_state(
 def _run_copilot_feedback(
     run_state: RunSectionState,
     *,
+    workspace_snapshot: WorkspaceSnapshot,
     progress_bar: object,
-    summary_placeholder: object,
+    progress_summary_placeholder: object,
     status_placeholder: object,
+    results_summary_placeholder: object,
+    results_table_placeholder: object,
 ) -> ActionFeedback:
     """Execute the run button path and return one persisted feedback block."""
     questionnaire = run_state.questionnaire
@@ -480,6 +550,13 @@ def _run_copilot_feedback(
         )
 
     _clear_last_run()
+    _clear_results_questionnaire()
+    _render_results_surface(
+        workspace_snapshot,
+        questionnaire=None,
+        summary_placeholder=results_summary_placeholder,
+        table_placeholder=results_table_placeholder,
+    )
     try:
         status_placeholder.info("Ensuring the local evidence index is ready for this run.")
         index_status = ensure_curated_evidence_index(force_rebuild=False)
@@ -504,7 +581,7 @@ def _run_copilot_feedback(
         run_id = _new_run_id()
         _set_run_progress(
             progress_bar,
-            summary_placeholder,
+            progress_summary_placeholder,
             status_placeholder,
             completed_count=0,
             total_questions=total_questions,
@@ -533,14 +610,21 @@ def _run_copilot_feedback(
                 )
                 status_level = "success"
 
+            _persist_results_questionnaire(run_questionnaire)
             _set_run_progress(
                 progress_bar,
-                summary_placeholder,
+                progress_summary_placeholder,
                 status_placeholder,
                 completed_count=completed_count,
                 total_questions=total_questions,
                 status_text=status_text,
                 status_level=status_level,
+            )
+            _render_results_surface(
+                workspace_snapshot,
+                questionnaire=run_questionnaire,
+                summary_placeholder=results_summary_placeholder,
+                table_placeholder=results_table_placeholder,
             )
 
         completed_questionnaire = run_questionnaire_answer_pipeline(
@@ -557,6 +641,7 @@ def _run_copilot_feedback(
         return _generic_action_error_feedback("Copilot run", exc)
 
     _persist_last_run(completed_questionnaire, run_id=run_id)
+    _persist_results_questionnaire(completed_questionnaire)
     return _build_run_feedback(
         completed_questionnaire,
         run_id=run_id,
@@ -626,15 +711,15 @@ def render_workspace_section() -> WorkspaceSnapshot:
     load_clicked = st.button(
         "Load Demo Workspace",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
     with st.expander("Advanced"):
         st.caption(
             "Recovery-only controls. Use these when you need to rebuild the local index "
             "or reset the curated demo workspace."
         )
-        rebuild_clicked = st.button("Rebuild Index", use_container_width=True)
-        reset_clicked = st.button("Reset Demo", use_container_width=True)
+        rebuild_clicked = st.button("Rebuild Index", width="stretch")
+        reset_clicked = st.button("Reset Demo", width="stretch")
 
     if load_clicked:
         with st.spinner("Preparing the demo workspace and ensuring the local index is ready..."):
@@ -674,7 +759,7 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
         run_clicked = st.button(
             "Run Copilot",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=not run_state.can_run,
         )
 
@@ -697,15 +782,26 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
         summary_placeholder=summary_placeholder,
         status_placeholder=status_placeholder,
     )
+    results_summary_placeholder = st.empty()
+    results_table_placeholder = st.empty()
+    _render_results_surface(
+        workspace_snapshot,
+        questionnaire=_results_questionnaire(),
+        summary_placeholder=results_summary_placeholder,
+        table_placeholder=results_table_placeholder,
+    )
 
     if run_clicked:
         with st.spinner("Running the curated questionnaire one row at a time..."):
             _persist_run_feedback(
                 _run_copilot_feedback(
                     run_state,
+                    workspace_snapshot=workspace_snapshot,
                     progress_bar=progress_bar,
-                    summary_placeholder=summary_placeholder,
+                    progress_summary_placeholder=summary_placeholder,
                     status_placeholder=status_placeholder,
+                    results_summary_placeholder=results_summary_placeholder,
+                    results_table_placeholder=results_table_placeholder,
                 )
             )
 
