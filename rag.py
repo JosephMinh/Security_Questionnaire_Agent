@@ -809,6 +809,8 @@ def get_or_create_chroma_collection(
         raise ValueError("collection_name must be a non-empty string.")
 
     persistence_path = chroma_persist_directory(persist_directory)
+    if persistence_path.exists() and not persistence_path.is_dir():
+        raise ValueError("persist_directory must resolve to a directory path.")
     persistence_path.mkdir(parents=True, exist_ok=True)
 
     chromadb = _import_chromadb()
