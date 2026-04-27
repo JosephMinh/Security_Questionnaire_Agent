@@ -108,6 +108,35 @@ class RunDeterministicDemoScriptTest(unittest.TestCase):
         self.assertEqual(len(unsupported.citations), 0)
         self.assertTrue(unsupported.answer.startswith("Not stated."))
 
+    def test_canonical_smoke_triad_matches_expected_fixture(self) -> None:
+        """The Q01/Q17/Q21 smoke triad should preserve the planned support matrix."""
+
+        with patch.object(self.script.rag, "RUNTIME_EVIDENCE_DIR", rag.SEED_EVIDENCE_DIR):
+            q01 = self.script._answer_result_for_expected(self.questions_by_id["Q01"])
+            q17 = self.script._answer_result_for_expected(self.questions_by_id["Q17"])
+            q21 = self.script._answer_result_for_expected(self.questions_by_id["Q21"])
+
+        self.assertEqual(q01.answer_type, rag.ANSWER_TYPE_SUPPORTED)
+        self.assertEqual(q01.status, rag.STATUS_READY_FOR_REVIEW)
+        self.assertEqual(q01.confidence_band, rag.CONFIDENCE_BAND_MEDIUM)
+        self.assertEqual(q01.reviewer_note, "")
+        self.assertEqual(len(q01.citations), 1)
+        self.assertTrue(q01.answer.startswith("Yes."))
+
+        self.assertEqual(q17.answer_type, rag.ANSWER_TYPE_PARTIAL)
+        self.assertEqual(q17.status, rag.STATUS_NEEDS_REVIEW)
+        self.assertEqual(q17.confidence_band, rag.CONFIDENCE_BAND_LOW)
+        self.assertEqual(q17.reviewer_note, self.questions_by_id["Q17"]["rationale"])
+        self.assertEqual(len(q17.citations), 1)
+        self.assertTrue(q17.answer.startswith("Partially."))
+
+        self.assertEqual(q21.answer_type, rag.ANSWER_TYPE_UNSUPPORTED)
+        self.assertEqual(q21.status, rag.STATUS_NEEDS_REVIEW)
+        self.assertEqual(q21.confidence_band, rag.CONFIDENCE_BAND_LOW)
+        self.assertEqual(q21.reviewer_note, self.questions_by_id["Q21"]["rationale"])
+        self.assertEqual(len(q21.citations), 0)
+        self.assertTrue(q21.answer.startswith("Not stated."))
+
     def test_clear_stale_publish_artifacts_removes_only_deterministic_rerun_paths(self) -> None:
         """Deterministic reruns should clear only their own stale backup/staging dirs."""
 
