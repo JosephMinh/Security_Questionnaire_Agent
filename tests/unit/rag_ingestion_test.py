@@ -1,4 +1,4 @@
-"""Unit coverage for evidence loading, normalization, chunking, and labels."""
+"""Unit coverage for evidence loading, chunking, and index lifecycle decisions."""
 
 from __future__ import annotations
 
@@ -30,7 +30,84 @@ class _FakePdfReader:
 
 
 class RagIngestionTest(unittest.TestCase):
-    """Verify the curated ingestion helpers stay deterministic and readable."""
+    """Verify the curated ingestion and indexing helpers stay deterministic."""
+
+    def _sample_evidence_chunks(self) -> tuple[rag.EvidenceChunk, ...]:
+        """Return one compact deterministic chunk set for index lifecycle tests."""
+        return (
+            rag.EvidenceChunk(
+                chunk_id="enc_001",
+                source=rag.ENCRYPTION_POLICY_FILE_NAME,
+                source_path=Path(rag.ENCRYPTION_POLICY_FILE_NAME),
+                doc_type=rag.DOCUMENT_TYPE_POLICY,
+                text="Encryption policy chunk.",
+                chunk_number=1,
+                start_offset=0,
+                end_offset=24,
+                section="Encryption Policy",
+                page=None,
+            ),
+            rag.EvidenceChunk(
+                chunk_id="acc_001",
+                source=rag.ACCESS_CONTROL_POLICY_FILE_NAME,
+                source_path=Path(rag.ACCESS_CONTROL_POLICY_FILE_NAME),
+                doc_type=rag.DOCUMENT_TYPE_POLICY,
+                text="Access control chunk.",
+                chunk_number=1,
+                start_offset=0,
+                end_offset=21,
+                section="Access Control Policy",
+                page=None,
+            ),
+            rag.EvidenceChunk(
+                chunk_id="soc2_001",
+                source=rag.SOC2_SUMMARY_FILE_NAME,
+                source_path=Path(rag.SOC2_SUMMARY_FILE_NAME),
+                doc_type=rag.DOCUMENT_TYPE_PDF,
+                text="SOC 2 summary chunk.",
+                chunk_number=1,
+                start_offset=0,
+                end_offset=20,
+                section=None,
+                page=1,
+            ),
+        )
+
+    def _assert_collection_matches_expected(
+        self,
+        status: rag.ChromaIndexStatus,
+        *,
+        expected_chunks: tuple[rag.EvidenceChunk, ...],
+        expected_workspace_hash: str,
+    ) -> None:
+        """Assert one ready status points at the expected current collection state."""
+        self.assertTrue(status.ready)
+        self.assertIsNotNone(status.collection_handle)
+
+        collection_handle = status.collection_handle
+        assert collection_handle is not None
+        payload = collection_handle.collection.get(include=["metadatas"])
+
+        self.assertEqual(status.actual_chunk_count, len(expected_chunks))
+        self.assertEqual(
+            collection_handle.collection.metadata,
+            {
+                "workspace_hash": expected_workspace_hash,
+                "chunk_count": len(expected_chunks),
+            },
+        )
+        self.assertEqual(
+            set(payload["ids"]),
+            {str(chunk.chunk_id) for chunk in expected_chunks},
+        )
+        self.assertEqual(
+            {
+                metadata["source"]
+                for metadata in payload["metadatas"]
+                if isinstance(metadata, dict)
+            },
+            {chunk.source for chunk in expected_chunks},
+        )
 
     def test_load_text_evidence_document_reads_supported_text_formats(self):
         """Markdown and plain-text evidence should load into the shared document shape."""
@@ -197,6 +274,202 @@ class RagIngestionTest(unittest.TestCase):
             ),
             "Encryption Policy",
         )
+
+    def test_ensure_curated_evidence_index_covers_create_reuse_and_rebuild_paths(self):
+        """Create, reuse, force-rebuild, and hash-change flows should stay explicit."""
+        expected_chunks = self._sample_evidence_chunks()
+        with TemporaryDirectory() as tmp_dir_name:
+            persist_directory = Path(tmp_dir_name) / "chroma"
+            with patch.object(
+                rag,
+                "build_curated_evidence_chunks",
+                return_value=expected_chunks,
+            ), patch.object(rag, "current_workspace_hash", return_value="hash-a"):
+                created = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory
+                )
+                self.assertEqual(created.index_action, rag.INDEX_ACTION_CREATED)
+                self.assertEqual(created.reason, "created")
+                self._assert_collection_matches_expected(
+                    created,
+                    expected_chunks=expected_chunks,
+                    expected_workspace_hash="hash-a",
+                )
+
+                reused = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory
+                )
+                self.assertEqual(reused.index_action, rag.INDEX_ACTION_REUSED)
+                self.assertEqual(reused.reason, "reused")
+                self._assert_collection_matches_expected(
+                    reused,
+                    expected_chunks=expected_chunks,
+                    expected_workspace_hash="hash-a",
+                )
+
+                forced = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory,
+                    force_rebuild=True,
+                )
+                self.assertEqual(forced.index_action, rag.INDEX_ACTION_REBUILT_CONTENT_CHANGE)
+                self.assertEqual(forced.reason, "force_rebuild")
+                self._assert_collection_matches_expected(
+                    forced,
+                    expected_chunks=expected_chunks,
+                    expected_workspace_hash="hash-a",
+                )
+
+            with patch.object(
+                rag,
+                "build_curated_evidence_chunks",
+                return_value=expected_chunks,
+            ), patch.object(rag, "current_workspace_hash", return_value="hash-b"):
+                changed = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory
+                )
+            self.assertEqual(changed.index_action, rag.INDEX_ACTION_REBUILT_CONTENT_CHANGE)
+            self.assertEqual(changed.reason, "workspace_hash_changed")
+            self._assert_collection_matches_expected(
+                changed,
+                expected_chunks=expected_chunks,
+                expected_workspace_hash="hash-b",
+            )
+
+    def test_ensure_curated_evidence_index_rebuilds_integrity_failures(self):
+        """Empty, partial, duplicated, and source-mismatched collections should rebuild."""
+        expected_chunks = self._sample_evidence_chunks()
+        scenarios = (
+            (
+                "collection_empty",
+                lambda handle: handle.collection.delete(ids=handle.collection.get()["ids"]),
+            ),
+            (
+                "duplicate_logical_chunk_ids",
+                lambda handle: handle.collection.upsert(
+                    ids=["enc_001"],
+                    documents=["duplicate logical chunk id"],
+                    metadatas=[
+                        {
+                            "chunk_id": "acc_001",
+                            "source": rag.ENCRYPTION_POLICY_FILE_NAME,
+                            "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                            "section": "Encryption Policy",
+                        }
+                    ],
+                ),
+            ),
+            (
+                "collection_payload_mismatch",
+                lambda handle: (
+                    handle.collection.delete(ids=["enc_001"]),
+                    handle.collection.upsert(
+                        ids=["rogue_001"],
+                        documents=["rogue chunk"],
+                        metadatas=[
+                            {
+                                "chunk_id": "rogue_001",
+                                "source": rag.ENCRYPTION_POLICY_FILE_NAME,
+                                "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                                "section": "Encryption Policy",
+                            }
+                        ],
+                    ),
+                ),
+            ),
+            (
+                "source_coverage_mismatch",
+                lambda handle: handle.collection.upsert(
+                    ids=["enc_001"],
+                    documents=["source coverage swap"],
+                    metadatas=[
+                        {
+                            "chunk_id": "enc_001",
+                            "source": rag.ACCESS_CONTROL_POLICY_FILE_NAME,
+                            "doc_type": rag.DOCUMENT_TYPE_POLICY,
+                            "section": "Encryption Policy",
+                        }
+                    ],
+                ),
+            ),
+        )
+
+        for expected_reason, mutate_collection in scenarios:
+            with self.subTest(reason=expected_reason):
+                with TemporaryDirectory() as tmp_dir_name:
+                    persist_directory = Path(tmp_dir_name) / "chroma"
+                    with patch.object(
+                        rag,
+                        "build_curated_evidence_chunks",
+                        return_value=expected_chunks,
+                    ), patch.object(rag, "current_workspace_hash", return_value="hash-a"):
+                        baseline = rag.ensure_curated_evidence_index(
+                            persist_directory=persist_directory
+                        )
+                        baseline_handle = baseline.collection_handle
+                        assert baseline_handle is not None
+                        mutate_collection(baseline_handle)
+
+                        blocked_reuse = rag.evaluate_chroma_reuse(
+                            persist_directory=persist_directory
+                        )
+                        rebuilt = rag.ensure_curated_evidence_index(
+                            persist_directory=persist_directory
+                        )
+
+                        self.assertFalse(blocked_reuse.reusable)
+                        self.assertEqual(blocked_reuse.reason, expected_reason)
+                        self.assertEqual(
+                            rebuilt.index_action,
+                            rag.INDEX_ACTION_REBUILT_INTEGRITY,
+                        )
+                        self.assertEqual(rebuilt.reason, expected_reason)
+                        self._assert_collection_matches_expected(
+                            rebuilt,
+                            expected_chunks=expected_chunks,
+                            expected_workspace_hash="hash-a",
+                        )
+
+    def test_ensure_curated_evidence_index_blocks_unrebuildable_state(self):
+        """Manifest or expected-chunk failures should stay blocked instead of rebuilding."""
+        expected_chunks = self._sample_evidence_chunks()
+        with TemporaryDirectory() as tmp_dir_name:
+            persist_directory = Path(tmp_dir_name) / "chroma"
+            with patch.object(
+                rag,
+                "build_curated_evidence_chunks",
+                return_value=expected_chunks,
+            ), patch.object(rag, "current_workspace_hash", return_value="hash-a"):
+                rag.ensure_curated_evidence_index(persist_directory=persist_directory)
+
+            with patch.object(
+                rag,
+                "build_curated_evidence_chunks",
+                return_value=expected_chunks,
+            ), patch.object(
+                rag,
+                "current_workspace_hash",
+                side_effect=FileNotFoundError("workspace manifest missing"),
+            ):
+                manifest_blocked = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory
+                )
+
+            with patch.object(
+                rag,
+                "build_curated_evidence_chunks",
+                side_effect=FileNotFoundError("expected chunks missing"),
+            ), patch.object(rag, "current_workspace_hash", return_value="hash-a"):
+                chunk_blocked = rag.ensure_curated_evidence_index(
+                    persist_directory=persist_directory
+                )
+
+        self.assertFalse(manifest_blocked.ready)
+        self.assertEqual(manifest_blocked.index_action, rag.INDEX_ACTION_BLOCKED)
+        self.assertEqual(manifest_blocked.reason, "manifest_unavailable")
+
+        self.assertFalse(chunk_blocked.ready)
+        self.assertEqual(chunk_blocked.index_action, rag.INDEX_ACTION_BLOCKED)
+        self.assertEqual(chunk_blocked.reason, "expected_chunks_unavailable")
 
 
 if __name__ == "__main__":
