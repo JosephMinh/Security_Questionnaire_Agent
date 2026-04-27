@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from shlex import join as shell_join
 from typing import Final, Mapping, Sequence
@@ -144,6 +144,7 @@ ANSWER_OPENING_TOKENS: Final[tuple[str, ...]] = (
 DOCUMENT_TYPE_MARKDOWN: Final[str] = "markdown"
 DOCUMENT_TYPE_TEXT: Final[str] = "text"
 DOCUMENT_TYPE_PDF: Final[str] = "pdf"
+DOCUMENT_TYPE_POLICY: Final[str] = "policy"
 TEXT_EVIDENCE_SUFFIXES: Final[tuple[str, ...]] = (".md", ".txt")
 CURATED_TEXT_EVIDENCE_FILE_NAMES: Final[tuple[str, ...]] = tuple(
     evidence_file_name
@@ -155,6 +156,20 @@ CURATED_PDF_EVIDENCE_FILE_NAMES: Final[tuple[str, ...]] = tuple(
     for evidence_file_name in EXPECTED_EVIDENCE_FILE_NAMES
     if Path(evidence_file_name).suffix.lower() == ".pdf"
 )
+CHUNK_ID_PREFIX_BY_SOURCE_FILE_NAME: Final[Mapping[str, str]] = {
+    ENCRYPTION_POLICY_FILE_NAME: "enc",
+    ACCESS_CONTROL_POLICY_FILE_NAME: "acc",
+    INCIDENT_RESPONSE_POLICY_FILE_NAME: "ir",
+    BACKUP_RECOVERY_POLICY_FILE_NAME: "bkp",
+    SOC2_SUMMARY_FILE_NAME: "soc2",
+}
+CHUNK_METADATA_DOC_TYPE_BY_SOURCE_FILE_NAME: Final[Mapping[str, str]] = {
+    ENCRYPTION_POLICY_FILE_NAME: DOCUMENT_TYPE_POLICY,
+    ACCESS_CONTROL_POLICY_FILE_NAME: DOCUMENT_TYPE_POLICY,
+    INCIDENT_RESPONSE_POLICY_FILE_NAME: DOCUMENT_TYPE_POLICY,
+    BACKUP_RECOVERY_POLICY_FILE_NAME: DOCUMENT_TYPE_POLICY,
+    SOC2_SUMMARY_FILE_NAME: DOCUMENT_TYPE_PDF,
+}
 
 RUNTIME_DIRECTORIES: Final[tuple[Path, ...]] = (
     RUNTIME_QUESTIONNAIRES_DIR,
@@ -311,14 +326,28 @@ class EvidenceDocument:
 class EvidenceChunk:
     """One deterministic chunk of normalized evidence text."""
 
-    source_file_name: str
+    chunk_id: str | None
+    source: str
     source_path: Path
     doc_type: str
     text: str
     chunk_number: int
     start_offset: int
     end_offset: int
-    page_number: int | None = None
+    section: str | None = None
+    page: int | None = None
+
+    def metadata(self) -> dict[str, str | int | None]:
+        """Return Chroma-ready metadata for one finalized chunk."""
+        if self.chunk_id is None:
+            raise ValueError("chunk_id is required before rendering chunk metadata.")
+        return {
+            "chunk_id": self.chunk_id,
+            "source": self.source,
+            "doc_type": self.doc_type,
+            "section": self.section,
+            "page": self.page,
+        }
 
 
 @dataclass(frozen=True)
@@ -874,6 +903,27 @@ def _chunk_boundaries(
     return tuple(boundaries)
 
 
+def _chunk_id_prefix_for_source(source_file_name: str) -> str:
+    """Return the stable chunk-id prefix for one curated evidence source."""
+    try:
+        return CHUNK_ID_PREFIX_BY_SOURCE_FILE_NAME[source_file_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported chunk-id source file {source_file_name!r} for the curated demo."
+        ) from exc
+
+
+def _chunk_metadata_doc_type_for_source(source_file_name: str) -> str:
+    """Return the metadata doc_type for one curated evidence source."""
+    try:
+        return CHUNK_METADATA_DOC_TYPE_BY_SOURCE_FILE_NAME[source_file_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported metadata doc_type source file {source_file_name!r} for the "
+            "curated demo."
+        ) from exc
+
+
 def chunk_evidence_document(
     document: EvidenceDocument,
     *,
@@ -888,14 +938,15 @@ def chunk_evidence_document(
     )
     return tuple(
         EvidenceChunk(
-            source_file_name=document.source_file_name,
+            chunk_id=None,
+            source=document.source_file_name,
             source_path=document.source_path,
-            doc_type=document.doc_type,
+            doc_type=_chunk_metadata_doc_type_for_source(document.source_file_name),
             text=document.text[start_offset:end_offset],
             chunk_number=chunk_number,
             start_offset=start_offset,
             end_offset=end_offset,
-            page_number=document.page_number,
+            page=document.page_number,
         )
         for chunk_number, (start_offset, end_offset) in enumerate(boundaries, start=1)
     )
@@ -907,16 +958,27 @@ def chunk_evidence_documents(
     chunk_size: int = CHUNK_SIZE_CHARS,
     chunk_overlap: int = CHUNK_OVERLAP_CHARS,
 ) -> tuple[EvidenceChunk, ...]:
-    """Chunk normalized evidence documents while preserving input order."""
+    """Chunk normalized evidence documents with stable source-level chunk IDs."""
     chunked_documents: list[EvidenceChunk] = []
+    chunk_numbers_by_source: dict[str, int] = {}
     for document in documents:
-        chunked_documents.extend(
-            chunk_evidence_document(
-                document,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
+        for chunk in chunk_evidence_document(
+            document,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        ):
+            next_chunk_number = chunk_numbers_by_source.get(chunk.source, 0) + 1
+            chunk_numbers_by_source[chunk.source] = next_chunk_number
+            chunked_documents.append(
+                replace(
+                    chunk,
+                    chunk_id=(
+                        f"{_chunk_id_prefix_for_source(chunk.source)}_"
+                        f"{next_chunk_number:03d}"
+                    ),
+                    chunk_number=next_chunk_number,
+                )
             )
-        )
     return tuple(chunked_documents)
 
 
