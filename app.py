@@ -719,9 +719,9 @@ def main() -> None:
     st.caption(APP_SUBTITLE)
     st.markdown(f"`{DEMO_MODE_LABEL}`")
     st.write(
-        "Single curated workspace demo: one bundled questionnaire, one bundled evidence "
-        "pack, and one local review flow. This app does not branch into generic uploads "
-        "or multi-workspace intake."
+        "Single curated workspace demo: one prepared questionnaire, one bundled "
+        "evidence pack, and one local review flow inside a single workspace. This app "
+        "does not branch into generic uploads or multi-workspace intake."
     )
     workspace_snapshot = render_workspace_section()
     render_run_section(workspace_snapshot)
