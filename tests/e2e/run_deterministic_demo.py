@@ -132,6 +132,8 @@ class JsonlLogSink:
     def __init__(self, *, log_path: Path, verbose: bool) -> None:
         self._log_path = log_path
         self._verbose = verbose
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path.write_text("", encoding="utf-8")
         self._records: list[dict[str, object]] = []
 
     def emit(
@@ -170,15 +172,13 @@ class JsonlLogSink:
             reason=reason,
         )
         self._records.append(record)
+        with self._log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True))
+            handle.write("\n")
         if self._verbose:
             print(json.dumps(record, sort_keys=True))
 
     def flush(self) -> Path:
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._log_path.open("w", encoding="utf-8") as handle:
-            for record in self._records:
-                handle.write(json.dumps(record, sort_keys=True))
-                handle.write("\n")
         return self._log_path
 
 

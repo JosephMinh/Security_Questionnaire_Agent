@@ -120,13 +120,36 @@ class JsonlLogger:
             print(line)
 
     def capture_rag_event(self, record: dict[str, object]) -> None:
+        question_id = record.get("question_id")
+        workspace_hash = record.get("workspace_hash")
+        index_action = record.get("index_action")
+        valid_citation_count = record.get("valid_citation_count")
+        answer_type = record.get("answer_type")
+        confidence_band = record.get("confidence_band")
+        review_status = record.get("review_status")
         self.emit(
             event=str(record.get("event", "unknown")),
             status=str(record.get("status", "unknown")),
             message=str(record.get("message", "")),
             level=str(record.get("level", "INFO")),
             run_id=str(record.get("run_id", SUITE_RUN_ID)),
+            question_id=str(question_id) if question_id is not None else None,
+            workspace_hash=str(workspace_hash) if workspace_hash is not None else None,
+            index_action=str(index_action) if index_action is not None else None,
+            valid_citation_count=(
+                int(valid_citation_count)
+                if isinstance(valid_citation_count, int)
+                else None
+            ),
+            answer_type=str(answer_type) if answer_type is not None else None,
+            confidence_band=(
+                str(confidence_band) if confidence_band is not None else None
+            ),
+            review_status=str(review_status) if review_status is not None else None,
+            artifact_path=record.get("artifact_path"),
             reason=str(record.get("reason")) if record.get("reason") is not None else None,
+            retrieved_chunk_count=record.get("retrieved_chunk_count"),
+            retry_attempt=record.get("retry_attempt"),
             source_component=record.get("component"),
             rag_record=record,
         )

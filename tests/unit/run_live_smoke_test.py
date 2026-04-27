@@ -107,6 +107,14 @@ class RunLiveSmokeScriptTest(unittest.TestCase):
                     "message": "Generated a supported answer with 1 valid citations and routed the row to Ready for Review.",
                     "question_id": "Q01",
                     "run_id": "live-smoke-e2e-q01",
+                    "workspace_hash": "workspace-hash",
+                    "index_action": rag.INDEX_ACTION_REUSED,
+                    "valid_citation_count": 1,
+                    "answer_type": rag.ANSWER_TYPE_SUPPORTED,
+                    "confidence_band": rag.CONFIDENCE_BAND_MEDIUM,
+                    "review_status": rag.STATUS_READY_FOR_REVIEW,
+                    "retrieved_chunk_count": 3,
+                    "retry_attempt": 0,
                 }
             )
 
@@ -124,6 +132,15 @@ class RunLiveSmokeScriptTest(unittest.TestCase):
         self.assertEqual(records[0]["retrieved_sources"][0], "Encryption_Policy.md")
         self.assertNotIn("answer", records[0])
         self.assertEqual(records[1]["component"], rag.LOG_COMPONENT_VERIFICATION)
+        self.assertEqual(records[1]["question_id"], "Q01")
+        self.assertEqual(records[1]["workspace_hash"], "workspace-hash")
+        self.assertEqual(records[1]["index_action"], rag.INDEX_ACTION_REUSED)
+        self.assertEqual(records[1]["valid_citation_count"], 1)
+        self.assertEqual(records[1]["answer_type"], rag.ANSWER_TYPE_SUPPORTED)
+        self.assertEqual(records[1]["confidence_band"], rag.CONFIDENCE_BAND_MEDIUM)
+        self.assertEqual(records[1]["review_status"], rag.STATUS_READY_FOR_REVIEW)
+        self.assertEqual(records[1]["retrieved_chunk_count"], 3)
+        self.assertEqual(records[1]["retry_attempt"], 0)
         self.assertEqual(records[1]["source_component"], "pipeline")
         self.assertEqual(records[1]["rag_record"]["question_id"], "Q01")
 

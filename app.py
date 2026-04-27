@@ -666,8 +666,10 @@ def _render_question_inspector(questionnaire: RuntimeQuestionnaire) -> None:
         st.markdown(f"**Confidence Band:** {str(selected_row['Confidence'])}")
         st.markdown("**Status**")
         st.markdown(_status_badge_markup(str(selected_row["Status"])), unsafe_allow_html=True)
-        st.markdown("**Reviewer Note**")
-        st.markdown(str(selected_row["Reviewer Notes"]))
+        reviewer_note = str(selected_row["Reviewer Notes"]).strip()
+        if reviewer_note:
+            st.markdown("**Reviewer Note**")
+            st.markdown(reviewer_note)
 
     review_queue_rows = _review_queue_rows(questionnaire)
     if not review_queue_rows:

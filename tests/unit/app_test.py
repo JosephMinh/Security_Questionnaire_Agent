@@ -842,6 +842,7 @@ class AppRunSectionTest(unittest.TestCase):
         review_queue_dataframe = at.dataframe[1].value
         self.assertEqual(list(review_queue_dataframe["Question ID"]), ["Q02"])
         markdown_values = [markdown.value for markdown in at.markdown]
+        self.assertFalse(any("Reviewer Note" in value for value in markdown_values))
         self.assertFalse(
             any(rag.FALLBACK_REVIEWER_NOTE in value for value in markdown_values)
         )
