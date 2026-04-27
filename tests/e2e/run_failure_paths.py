@@ -455,6 +455,19 @@ def _scenario_pipeline_and_exports(
         "No-retrieval rows should route to Needs Review.",
     )
     _require(
+        str(completed.rows[0]["Answer"]) == rag.FAIL_CLOSED_ANSWER,
+        "No-retrieval rows should use the canonical fail-closed answer text.",
+    )
+    _require(
+        str(completed.rows[0]["Confidence"]) == rag.CONFIDENCE_BAND_LOW,
+        "No-retrieval rows should fail closed with Low confidence.",
+    )
+    _require(
+        str(completed.rows[0]["Reviewer Notes"])
+        == rag.FAIL_CLOSED_REVIEWER_NOTE_BY_REASON[rag.FAILURE_REASON_NO_RETRIEVAL],
+        "No-retrieval rows should expose the canonical reviewer note.",
+    )
+    _require(
         str(completed.rows[1]["status"]) == rag.STATUS_READY_FOR_REVIEW,
         "Retry-success rows should land in Ready for Review.",
     )
@@ -465,6 +478,19 @@ def _scenario_pipeline_and_exports(
     _require(
         str(completed.rows[1]["Answer"]).startswith("Yes."),
         "The retry-success row should retain the successful supported answer.",
+    )
+    _require(
+        str(completed.rows[2]["Answer"]) == rag.FAIL_CLOSED_ANSWER,
+        "All-invalid-citation rows should use the canonical fail-closed answer text.",
+    )
+    _require(
+        str(completed.rows[2]["Confidence"]) == rag.CONFIDENCE_BAND_LOW,
+        "All-invalid-citation rows should fail closed with Low confidence.",
+    )
+    _require(
+        str(completed.rows[2]["Reviewer Notes"])
+        == rag.FAIL_CLOSED_REVIEWER_NOTE_BY_REASON["no_valid_citations"],
+        "All-invalid-citation rows should expose the canonical reviewer note.",
     )
 
     retrying_events = [
