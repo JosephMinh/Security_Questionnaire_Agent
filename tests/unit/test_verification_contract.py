@@ -8,11 +8,13 @@ from rag import (
     CANONICAL_VERIFICATION_COMMANDS,
     CLOSEOUT_AUDIT_RULES,
     FULL_LOCAL_VALIDATION_COMMAND_NAMES,
+    LOG_OPTIONAL_FIELDS,
     LOG_COMPONENTS,
     LOG_REQUIRED_FIELDS,
     OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES,
     QUICK_CONFIDENCE_COMMAND_NAMES,
     TEST_SEAMS,
+    build_structured_log_record,
     verification_command_by_name,
     verification_sequence_shell_commands,
 )
@@ -66,9 +68,48 @@ class VerificationContractTests(unittest.TestCase):
             LOG_REQUIRED_FIELDS,
             ("ts", "level", "component", "event", "run_id", "status", "message"),
         )
+        self.assertIn("answer_type", LOG_OPTIONAL_FIELDS)
+        self.assertIn("confidence_band", LOG_OPTIONAL_FIELDS)
+        self.assertIn("review_status", LOG_OPTIONAL_FIELDS)
         self.assertEqual(
             set(LOG_COMPONENTS),
             {"setup", "indexing", "pipeline", "ui", "export", "verification"},
+        )
+
+    def test_build_structured_log_record_includes_required_and_selected_optional_fields(self) -> None:
+        record = build_structured_log_record(
+            component="pipeline",
+            event="row_completed",
+            run_id="run-001",
+            status="completed",
+            message="Completed Q01 as supported with 2 valid citations.",
+            question_id="Q01",
+            workspace_hash="workspace-hash",
+            manifest_hash="manifest-hash",
+            index_action="reused",
+            retrieved_chunk_count=5,
+            valid_citation_count=2,
+            answer_type="supported",
+            confidence_band="High",
+            review_status="Ready for Review",
+            retry_attempt=1,
+            artifact_path="data/outputs/Answered_Questionnaire.xlsx",
+            reason="reused",
+        )
+        self.assertEqual(record["component"], "pipeline")
+        self.assertEqual(record["event"], "row_completed")
+        self.assertEqual(record["run_id"], "run-001")
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["question_id"], "Q01")
+        self.assertEqual(record["retrieved_chunk_count"], 5)
+        self.assertEqual(record["valid_citation_count"], 2)
+        self.assertEqual(record["answer_type"], "supported")
+        self.assertEqual(record["confidence_band"], "High")
+        self.assertEqual(record["review_status"], "Ready for Review")
+        self.assertEqual(record["retry_attempt"], 1)
+        self.assertEqual(
+            record["artifact_path"],
+            "data/outputs/Answered_Questionnaire.xlsx",
         )
 
     def test_test_seams_cover_the_expected_boundaries(self) -> None:

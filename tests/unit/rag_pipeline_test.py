@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -449,6 +450,136 @@ class RagPipelineTest(unittest.TestCase):
         self.assertEqual(run.rows[1]["index_action"], rag.INDEX_ACTION_REBUILT_INTEGRITY)
         self.assertEqual(run.rows[2]["Answer"], "Yes. Privileged access is reviewed quarterly.")
         self.assertEqual(run.rows[2]["run_id"], "run-fail-closed")
+
+    def test_run_questionnaire_answer_pipeline_emits_structured_pipeline_logs(self):
+        """Pipeline orchestration should expose a stable structured event stream."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+        retrieved_chunks = (
+            rag.RetrievedEvidenceChunk(
+                chunk_id="enc_001",
+                source=rag.ENCRYPTION_POLICY_FILE_NAME,
+                source_path=rag.RUNTIME_EVIDENCE_DIR / rag.ENCRYPTION_POLICY_FILE_NAME,
+                doc_type=rag.DOCUMENT_TYPE_POLICY,
+                text="Customer data is encrypted at rest with AES-256.",
+                rank=1,
+                section="Data at Rest",
+            ),
+        )
+        log_events: list[dict[str, object]] = []
+
+        with patch.object(
+            rag,
+            "retrieve_evidence_chunks_for_row",
+            return_value=retrieved_chunks,
+        ):
+            with patch.object(
+                rag,
+                "generate_answer_result",
+                return_value=_answer_result(
+                    answer="Yes. Customer data is encrypted at rest.",
+                    answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                    citation_ids=("enc_001",),
+                    citations=(
+                        _citation(
+                            chunk_id="enc_001",
+                            label="Encryption Policy — Data at Rest",
+                            snippet="Customer data is encrypted at rest with AES-256.",
+                            source=rag.ENCRYPTION_POLICY_FILE_NAME,
+                            section="Data at Rest",
+                        ),
+                    ),
+                    confidence_score=rag.SUPPORTED_WITH_ONE_CITATION_SCORE,
+                    confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                    status=rag.STATUS_READY_FOR_REVIEW,
+                    reviewer_note="Primary policy statement is explicit.",
+                ),
+            ):
+                rag.run_questionnaire_answer_pipeline(
+                    questionnaire,
+                    index_status=_ready_index_status(),
+                    run_id="run-logs",
+                    on_log_event=log_events.append,
+                )
+
+        self.assertEqual(
+            [str(event["event"]) for event in log_events],
+            [
+                "pipeline_started",
+                "row_started",
+                "row_retrieved",
+                "row_completed",
+                "pipeline_completed",
+            ],
+        )
+        row_completed_event = log_events[3]
+        self.assertEqual(row_completed_event["question_id"], "Q01")
+        self.assertEqual(row_completed_event["answer_type"], rag.ANSWER_TYPE_SUPPORTED)
+        self.assertEqual(row_completed_event["confidence_band"], rag.CONFIDENCE_BAND_MEDIUM)
+        self.assertEqual(row_completed_event["review_status"], rag.STATUS_READY_FOR_REVIEW)
+        self.assertEqual(row_completed_event["valid_citation_count"], 1)
+        self.assertEqual(row_completed_event["retrieved_chunk_count"], 1)
+
+    def test_publish_export_packet_emits_structured_export_logs(self):
+        """Export publication should emit staging and final publish events."""
+        completed_row = rag.update_row_with_answer_result(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            ),
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                citation_ids=("enc_001",),
+                citations=(
+                    _citation(
+                        chunk_id="enc_001",
+                        label="Encryption Policy — Data at Rest",
+                        snippet="Customer data is encrypted at rest with AES-256.",
+                        source=rag.ENCRYPTION_POLICY_FILE_NAME,
+                        section="Data at Rest",
+                    ),
+                ),
+                confidence_score=rag.SUPPORTED_WITH_ONE_CITATION_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                status=rag.STATUS_READY_FOR_REVIEW,
+                reviewer_note="Primary policy statement is explicit.",
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="run-export-logs",
+        )
+        questionnaire = _runtime_questionnaire(completed_row)
+        log_events: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            packet = rag.publish_export_packet(
+                questionnaire,
+                output_dir=Path(temp_dir) / "outputs",
+                completed_at="2026-04-27T23:00:00Z",
+                workspace_hash="workspace-hash",
+                on_log_event=log_events.append,
+            )
+
+        self.assertTrue(packet.output_dir.name == "outputs")
+        self.assertEqual(
+            [str(event["event"]) for event in log_events],
+            [
+                "export_publish_started",
+                "answered_questionnaire_written",
+                "review_summary_written",
+                "needs_review_csv_written",
+                "export_published",
+            ],
+        )
+        self.assertTrue(
+            str(log_events[-1]["artifact_path"]).endswith("outputs")
+        )
 
 
 if __name__ == "__main__":

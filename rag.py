@@ -5,7 +5,9 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from shlex import join as shell_join
@@ -198,6 +200,13 @@ INDEX_ACTION_REUSED: Final[str] = "reused"
 INDEX_ACTION_REBUILT_CONTENT_CHANGE: Final[str] = "rebuilt_content_change"
 INDEX_ACTION_REBUILT_INTEGRITY: Final[str] = "rebuilt_integrity"
 INDEX_ACTION_BLOCKED: Final[str] = "blocked"
+INDEX_ACTIONS: Final[tuple[str, ...]] = (
+    INDEX_ACTION_CREATED,
+    INDEX_ACTION_REUSED,
+    INDEX_ACTION_REBUILT_CONTENT_CHANGE,
+    INDEX_ACTION_REBUILT_INTEGRITY,
+    INDEX_ACTION_BLOCKED,
+)
 AUTO_REBUILD_INTEGRITY_REASONS: Final[frozenset[str]] = frozenset(
     {
         "collection_empty",
@@ -368,6 +377,9 @@ LOG_OPTIONAL_FIELDS: Final[tuple[str, ...]] = (
     "index_action",
     "retrieved_chunk_count",
     "valid_citation_count",
+    "answer_type",
+    "confidence_band",
+    "review_status",
     "retry_attempt",
     "artifact_path",
     "reason",
@@ -906,6 +918,24 @@ LOG_FIELD_SPECS: Final[tuple[LogFieldSpec, ...]] = (
         purpose="Valid citation count after payload validation and dedupe.",
     ),
     LogFieldSpec(
+        name="answer_type",
+        required=False,
+        example=ANSWER_TYPE_SUPPORTED,
+        purpose="Final supported, partial, or unsupported answer classification.",
+    ),
+    LogFieldSpec(
+        name="confidence_band",
+        required=False,
+        example=CONFIDENCE_BAND_HIGH,
+        purpose="Deterministic reviewer-facing confidence band for the completed row.",
+    ),
+    LogFieldSpec(
+        name="review_status",
+        required=False,
+        example=STATUS_READY_FOR_REVIEW,
+        purpose="Final reviewer routing state for the completed row.",
+    ),
+    LogFieldSpec(
         name="retry_attempt",
         required=False,
         example="1",
@@ -931,6 +961,21 @@ LOGGING_CONVENTIONS: Final[tuple[str, ...]] = (
     "Use question_id for row-level events, workspace_hash or manifest_hash for reuse decisions, and artifact_path for published outputs.",
     "Do not log API keys, raw secrets, or full provider transcripts by default.",
 )
+
+RUNTIME_LOGGER_NAME: Final[str] = "security_questionnaire_agent.runtime"
+_RUNTIME_LOGGER: Final[logging.Logger] = logging.getLogger(RUNTIME_LOGGER_NAME)
+if not _RUNTIME_LOGGER.handlers:
+    _runtime_handler = logging.StreamHandler()
+    _runtime_handler.setFormatter(logging.Formatter("%(message)s"))
+    _RUNTIME_LOGGER.addHandler(_runtime_handler)
+_RUNTIME_LOGGER.setLevel(logging.INFO)
+_RUNTIME_LOGGER.propagate = False
+
+_LOG_LEVEL_NUMBERS: Final[Mapping[str, int]] = {
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
 
 CONSERVATIVE_ANSWER_SYSTEM_PROMPT: Final[str] = "\n".join(
     (
@@ -1110,6 +1155,225 @@ def current_workspace_hash(manifest_path: Path | None = None) -> str:
             f"Runtime workspace manifest {path} is missing a valid `workspace_hash`."
         )
     return workspace_hash
+
+
+def current_manifest_hash(manifest_path: Path | None = None) -> str:
+    """Return one stable digest for the current runtime workspace manifest payload."""
+    path = manifest_path or runtime_manifest_path()
+    if not path.exists():
+        raise FileNotFoundError(
+            "Runtime workspace manifest is missing at "
+            f"{path}. Run `python generate_demo_data.py` before indexing."
+        )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _best_effort_workspace_hash(manifest_path: Path | None = None) -> str | None:
+    try:
+        return current_workspace_hash(manifest_path)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _best_effort_manifest_hash(manifest_path: Path | None = None) -> str | None:
+    try:
+        return current_manifest_hash(manifest_path)
+    except FileNotFoundError:
+        return None
+
+
+def _default_log_run_id(component: str, workspace_hash: str | None = None) -> str:
+    """Return one deterministic non-empty run identifier for non-row operations."""
+    normalized_component = component.strip()
+    if normalized_component not in LOG_COMPONENTS:
+        raise ValueError(f"Unsupported log component {component!r}.")
+
+    hash_token = workspace_hash.strip()[:12] if isinstance(workspace_hash, str) else ""
+    return f"{normalized_component}-{hash_token or 'unknown'}"
+
+
+def _relative_log_artifact_path(path_value: str | Path) -> str:
+    """Return one stable repo-relative artifact path when possible."""
+    path = Path(path_value)
+    resolved_path = path.expanduser().resolve()
+    try:
+        return str(resolved_path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved_path)
+
+
+def build_structured_log_record(
+    *,
+    component: str,
+    event: str,
+    run_id: str,
+    status: str,
+    message: str,
+    level: str = "INFO",
+    question_id: str | None = None,
+    workspace_hash: str | None = None,
+    manifest_hash: str | None = None,
+    index_action: str | None = None,
+    retrieved_chunk_count: int | None = None,
+    valid_citation_count: int | None = None,
+    answer_type: str | None = None,
+    confidence_band: str | None = None,
+    review_status: str | None = None,
+    retry_attempt: int | None = None,
+    artifact_path: str | Path | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    """Build one schema-valid structured runtime log record."""
+    normalized_component = component.strip()
+    if normalized_component not in LOG_COMPONENTS:
+        raise ValueError(f"Unsupported log component {component!r}.")
+
+    normalized_event = event.strip()
+    if not normalized_event:
+        raise ValueError("event must be a non-empty string.")
+
+    normalized_run_id = run_id.strip()
+    if not normalized_run_id:
+        raise ValueError("run_id must be a non-empty string.")
+
+    normalized_status = status.strip()
+    if normalized_status not in LOG_STATUSES:
+        raise ValueError(f"Unsupported log status {status!r}.")
+
+    normalized_level = level.strip().upper()
+    if normalized_level not in LOG_LEVELS:
+        raise ValueError(f"Unsupported log level {level!r}.")
+
+    normalized_message = message.strip()
+    if not normalized_message:
+        raise ValueError("message must be a non-empty string.")
+
+    record: dict[str, object] = {
+        "ts": completed_run_timestamp(),
+        "level": normalized_level,
+        "component": normalized_component,
+        "event": normalized_event,
+        "run_id": normalized_run_id,
+        "status": normalized_status,
+        "message": normalized_message,
+    }
+
+    def add_optional_string(name: str, value: str | None) -> None:
+        if value is None:
+            return
+        normalized_value = value.strip()
+        if normalized_value:
+            record[name] = normalized_value
+
+    add_optional_string("question_id", question_id)
+    add_optional_string("workspace_hash", workspace_hash)
+    add_optional_string("manifest_hash", manifest_hash)
+
+    if index_action is not None:
+        normalized_index_action = index_action.strip()
+        if not normalized_index_action:
+            raise ValueError("index_action must be a non-empty string when provided.")
+        if normalized_index_action not in INDEX_ACTIONS:
+            raise ValueError(f"Unsupported index_action {index_action!r}.")
+        record["index_action"] = normalized_index_action
+
+    if retrieved_chunk_count is not None:
+        if retrieved_chunk_count < 0:
+            raise ValueError("retrieved_chunk_count must be zero or greater.")
+        record["retrieved_chunk_count"] = retrieved_chunk_count
+
+    if valid_citation_count is not None:
+        if valid_citation_count < 0:
+            raise ValueError("valid_citation_count must be zero or greater.")
+        record["valid_citation_count"] = valid_citation_count
+
+    if answer_type is not None:
+        normalized_answer_type = answer_type.strip()
+        if normalized_answer_type not in ANSWER_TYPES:
+            raise ValueError(f"Unsupported answer_type {answer_type!r}.")
+        record["answer_type"] = normalized_answer_type
+
+    if confidence_band is not None:
+        normalized_confidence_band = confidence_band.strip()
+        if normalized_confidence_band not in (
+            CONFIDENCE_BAND_HIGH,
+            CONFIDENCE_BAND_MEDIUM,
+            CONFIDENCE_BAND_LOW,
+        ):
+            raise ValueError(f"Unsupported confidence_band {confidence_band!r}.")
+        record["confidence_band"] = normalized_confidence_band
+
+    if review_status is not None:
+        normalized_review_status = review_status.strip()
+        if normalized_review_status not in (
+            STATUS_READY_FOR_REVIEW,
+            STATUS_NEEDS_REVIEW,
+        ):
+            raise ValueError(f"Unsupported review_status {review_status!r}.")
+        record["review_status"] = normalized_review_status
+
+    if retry_attempt is not None:
+        if retry_attempt < 0:
+            raise ValueError("retry_attempt must be zero or greater.")
+        record["retry_attempt"] = retry_attempt
+
+    if artifact_path is not None:
+        record["artifact_path"] = _relative_log_artifact_path(artifact_path)
+
+    add_optional_string("reason", reason)
+    return record
+
+
+def emit_structured_log(
+    *,
+    component: str,
+    event: str,
+    run_id: str,
+    status: str,
+    message: str,
+    level: str = "INFO",
+    question_id: str | None = None,
+    workspace_hash: str | None = None,
+    manifest_hash: str | None = None,
+    index_action: str | None = None,
+    retrieved_chunk_count: int | None = None,
+    valid_citation_count: int | None = None,
+    answer_type: str | None = None,
+    confidence_band: str | None = None,
+    review_status: str | None = None,
+    retry_attempt: int | None = None,
+    artifact_path: str | Path | None = None,
+    reason: str | None = None,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """Emit one structured JSONL runtime record and optionally mirror it to a hook."""
+    record = build_structured_log_record(
+        component=component,
+        event=event,
+        run_id=run_id,
+        status=status,
+        message=message,
+        level=level,
+        question_id=question_id,
+        workspace_hash=workspace_hash,
+        manifest_hash=manifest_hash,
+        index_action=index_action,
+        retrieved_chunk_count=retrieved_chunk_count,
+        valid_citation_count=valid_citation_count,
+        answer_type=answer_type,
+        confidence_band=confidence_band,
+        review_status=review_status,
+        retry_attempt=retry_attempt,
+        artifact_path=artifact_path,
+        reason=reason,
+    )
+    _RUNTIME_LOGGER.log(
+        _LOG_LEVEL_NUMBERS[str(record["level"])],
+        json.dumps(record, sort_keys=True),
+    )
+    if on_log_event is not None:
+        on_log_event(dict(record))
+    return record
 
 
 def chroma_persist_directory(persist_directory: Path | None = None) -> Path:
@@ -1925,6 +2189,7 @@ def _persisted_index_status(
     manifest_path: Path | None = None,
     index_action: str,
     reason: str,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> ChromaIndexStatus:
     """Persist the curated index and return the resulting ready status."""
     workspace_hash = current_workspace_hash(manifest_path)
@@ -1945,7 +2210,7 @@ def _persisted_index_status(
         )
 
     chunk_count = len(persisted_chunks)
-    return ChromaIndexStatus(
+    index_status = ChromaIndexStatus(
         collection_name=collection_handle.collection_name,
         persist_directory=collection_handle.persist_directory,
         workspace_hash=workspace_hash,
@@ -1957,6 +2222,21 @@ def _persisted_index_status(
         reason=reason,
         collection_handle=collection_handle,
     )
+    emit_structured_log(
+        component=LOG_COMPONENT_INDEXING,
+        event="index_materialized",
+        run_id=_default_log_run_id(LOG_COMPONENT_INDEXING, workspace_hash),
+        status=LOG_STATUS_COMPLETED,
+        message=(
+            f"Persisted curated evidence index as {index_action} with {chunk_count} chunks."
+        ),
+        workspace_hash=workspace_hash,
+        manifest_hash=_best_effort_manifest_hash(manifest_path),
+        index_action=index_action,
+        reason=reason,
+        on_log_event=on_log_event,
+    )
+    return index_status
 
 
 def create_curated_evidence_index(
@@ -1965,8 +2245,21 @@ def create_curated_evidence_index(
     persist_directory: Path | None = None,
     evidence_dir: Path | None = None,
     manifest_path: Path | None = None,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> ChromaIndexStatus:
     """Create the canonical demo index when no reusable collection exists yet."""
+    workspace_hash = _best_effort_workspace_hash(manifest_path)
+    emit_structured_log(
+        component=LOG_COMPONENT_INDEXING,
+        event="index_create_started",
+        run_id=_default_log_run_id(LOG_COMPONENT_INDEXING, workspace_hash),
+        status=LOG_STATUS_STARTED,
+        message="Creating the curated evidence index because no reusable collection exists.",
+        workspace_hash=workspace_hash,
+        manifest_hash=_best_effort_manifest_hash(manifest_path),
+        index_action=INDEX_ACTION_CREATED,
+        on_log_event=on_log_event,
+    )
     return _persisted_index_status(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -1974,6 +2267,7 @@ def create_curated_evidence_index(
         manifest_path=manifest_path,
         index_action=INDEX_ACTION_CREATED,
         reason="created",
+        on_log_event=on_log_event,
     )
 
 
@@ -2002,8 +2296,24 @@ def rebuild_curated_evidence_index(
     manifest_path: Path | None = None,
     index_action: str = INDEX_ACTION_REBUILT_CONTENT_CHANGE,
     reason: str = "workspace_hash_changed",
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> ChromaIndexStatus:
     """Delete and recreate the canonical demo index for the current workspace."""
+    workspace_hash = _best_effort_workspace_hash(manifest_path)
+    emit_structured_log(
+        component=LOG_COMPONENT_INDEXING,
+        event="index_rebuild_started",
+        run_id=_default_log_run_id(LOG_COMPONENT_INDEXING, workspace_hash),
+        status=LOG_STATUS_STARTED,
+        message=(
+            f"Rebuilding the curated evidence index as {index_action} because {reason}."
+        ),
+        workspace_hash=workspace_hash,
+        manifest_hash=_best_effort_manifest_hash(manifest_path),
+        index_action=index_action,
+        reason=reason,
+        on_log_event=on_log_event,
+    )
     delete_existing_chroma_collection(
         collection_name=collection_name,
         persist_directory=persist_directory,
@@ -2015,6 +2325,7 @@ def rebuild_curated_evidence_index(
         manifest_path=manifest_path,
         index_action=index_action,
         reason=reason,
+        on_log_event=on_log_event,
     )
 
 
@@ -2025,6 +2336,7 @@ def ensure_curated_evidence_index(
     evidence_dir: Path | None = None,
     manifest_path: Path | None = None,
     force_rebuild: bool = False,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> ChromaIndexStatus:
     """Create, reuse, or rebuild the canonical demo index as needed."""
     reuse_status = evaluate_chroma_reuse(
@@ -2033,15 +2345,35 @@ def ensure_curated_evidence_index(
         evidence_dir=evidence_dir,
         manifest_path=manifest_path,
     )
+    run_id = _default_log_run_id(LOG_COMPONENT_INDEXING, reuse_status.workspace_hash)
+    manifest_hash = _best_effort_manifest_hash(manifest_path)
     if force_rebuild:
         if reuse_status.reason in BLOCKED_INDEX_REASONS:
-            return _index_status_from_reuse_status(reuse_status)
+            index_status = _index_status_from_reuse_status(reuse_status)
+            emit_structured_log(
+                component=LOG_COMPONENT_INDEXING,
+                event="index_blocked",
+                run_id=run_id,
+                status=LOG_STATUS_BLOCKED,
+                level="WARNING",
+                message=(
+                    "Force rebuild was requested, but the curated evidence index is "
+                    f"blocked because {reuse_status.reason}."
+                ),
+                workspace_hash=reuse_status.workspace_hash,
+                manifest_hash=manifest_hash,
+                index_action=index_status.index_action,
+                reason=index_status.reason,
+                on_log_event=on_log_event,
+            )
+            return index_status
         if reuse_status.reason == "collection_missing":
             return create_curated_evidence_index(
                 collection_name=collection_name,
                 persist_directory=persist_directory,
                 evidence_dir=evidence_dir,
                 manifest_path=manifest_path,
+                on_log_event=on_log_event,
             )
         return rebuild_curated_evidence_index(
             collection_name=collection_name,
@@ -2050,10 +2382,27 @@ def ensure_curated_evidence_index(
             manifest_path=manifest_path,
             index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
             reason="force_rebuild",
+            on_log_event=on_log_event,
         )
 
     if reuse_status.reusable:
-        return _index_status_from_reuse_status(reuse_status)
+        index_status = _index_status_from_reuse_status(reuse_status)
+        emit_structured_log(
+            component=LOG_COMPONENT_INDEXING,
+            event="index_reused",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message=(
+                f"Reused the curated evidence index with {reuse_status.actual_chunk_count} "
+                "persisted chunks."
+            ),
+            workspace_hash=reuse_status.workspace_hash,
+            manifest_hash=manifest_hash,
+            index_action=index_status.index_action,
+            reason=index_status.reason,
+            on_log_event=on_log_event,
+        )
+        return index_status
 
     if reuse_status.reason == "collection_missing":
         return create_curated_evidence_index(
@@ -2061,6 +2410,7 @@ def ensure_curated_evidence_index(
             persist_directory=persist_directory,
             evidence_dir=evidence_dir,
             manifest_path=manifest_path,
+            on_log_event=on_log_event,
         )
 
     if reuse_status.reason == "workspace_hash_mismatch":
@@ -2071,6 +2421,7 @@ def ensure_curated_evidence_index(
             manifest_path=manifest_path,
             index_action=INDEX_ACTION_REBUILT_CONTENT_CHANGE,
             reason="workspace_hash_changed",
+            on_log_event=on_log_event,
         )
 
     if reuse_status.reason in AUTO_REBUILD_INTEGRITY_REASONS:
@@ -2081,9 +2432,27 @@ def ensure_curated_evidence_index(
             manifest_path=manifest_path,
             index_action=INDEX_ACTION_REBUILT_INTEGRITY,
             reason=reuse_status.reason,
+            on_log_event=on_log_event,
         )
 
-    return _index_status_from_reuse_status(reuse_status)
+    index_status = _index_status_from_reuse_status(reuse_status)
+    emit_structured_log(
+        component=LOG_COMPONENT_INDEXING,
+        event="index_blocked",
+        run_id=run_id,
+        status=LOG_STATUS_BLOCKED,
+        level="WARNING",
+        message=(
+            "The curated evidence index is not ready and could not be reused "
+            f"because {reuse_status.reason}."
+        ),
+        workspace_hash=reuse_status.workspace_hash,
+        manifest_hash=manifest_hash,
+        index_action=index_status.index_action,
+        reason=index_status.reason,
+        on_log_event=on_log_event,
+    )
+    return index_status
 
 
 def _require_ready_collection_handle(
@@ -2436,13 +2805,41 @@ def generate_answer_result(
     *,
     model: str = DEFAULT_OPENAI_ANSWER_MODEL,
     openai_client: Any | None = None,
+    question_id: str | None = None,
+    run_id: str | None = None,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> GeneratedAnswerResult:
     """Generate one answer result with fail-closed routing and at most one retry."""
+    resolved_run_id = (
+        run_id.strip()
+        if isinstance(run_id, str) and run_id.strip()
+        else _default_log_run_id(LOG_COMPONENT_PIPELINE)
+    )
     if not retrieved_chunks:
-        return _build_fail_closed_answer_result(
+        result = _build_fail_closed_answer_result(
             FAILURE_REASON_NO_RETRIEVAL,
             retry_count=0,
         )
+        emit_structured_log(
+            component=LOG_COMPONENT_PIPELINE,
+            event="answer_failed_closed",
+            run_id=resolved_run_id,
+            status=LOG_STATUS_FAILED,
+            level="WARNING",
+            message=(
+                "Answer generation failed closed because no evidence was retrieved "
+                "for the question."
+            ),
+            question_id=question_id,
+            retrieved_chunk_count=0,
+            valid_citation_count=0,
+            answer_type=result.answer_type,
+            confidence_band=result.confidence_band,
+            review_status=result.status,
+            reason=result.failure_reason,
+            on_log_event=on_log_event,
+        )
+        return result
 
     retry_count = 0
     while True:
@@ -2457,11 +2854,48 @@ def generate_answer_result(
             if _is_retryable_generation_error(error):
                 if retry_count < MODEL_RETRY_LIMIT:
                     retry_count += 1
+                    emit_structured_log(
+                        component=LOG_COMPONENT_PIPELINE,
+                        event="answer_retrying",
+                        run_id=resolved_run_id,
+                        status=LOG_STATUS_RETRYING,
+                        level="WARNING",
+                        message=(
+                            "Retrying answer generation after a provider response "
+                            "validation failure."
+                        ),
+                        question_id=question_id,
+                        retrieved_chunk_count=len(retrieved_chunks),
+                        retry_attempt=retry_count,
+                        reason=FAILURE_REASON_MODEL_OUTPUT_INVALID,
+                        on_log_event=on_log_event,
+                    )
                     continue
-                return _build_fail_closed_answer_result(
+                result = _build_fail_closed_answer_result(
                     FAILURE_REASON_MODEL_OUTPUT_INVALID,
                     retry_count=retry_count,
                 )
+                emit_structured_log(
+                    component=LOG_COMPONENT_PIPELINE,
+                    event="answer_failed_closed",
+                    run_id=resolved_run_id,
+                    status=LOG_STATUS_FAILED,
+                    level="WARNING",
+                    message=(
+                        "Answer generation failed closed after retrying an invalid "
+                        "provider response."
+                    ),
+                    question_id=question_id,
+                    retrieved_chunk_count=len(retrieved_chunks),
+                    valid_citation_count=0,
+                    answer_type=result.answer_type,
+                    confidence_band=result.confidence_band,
+                    review_status=result.status,
+                    retry_attempt=result.retry_count,
+                    reason=result.failure_reason,
+                    on_log_event=on_log_event,
+                )
+                return result
             raise
 
         validation_result = validate_answer_payload(payload, retrieved_chunks)
@@ -2472,17 +2906,75 @@ def generate_answer_result(
                 and retry_count < MODEL_RETRY_LIMIT
             ):
                 retry_count += 1
+                emit_structured_log(
+                    component=LOG_COMPONENT_PIPELINE,
+                    event="answer_retrying",
+                    run_id=resolved_run_id,
+                    status=LOG_STATUS_RETRYING,
+                    level="WARNING",
+                    message=(
+                        "Retrying answer generation after payload validation rejected "
+                        f"the provider response as {failure_reason}."
+                    ),
+                    question_id=question_id,
+                    retrieved_chunk_count=len(retrieved_chunks),
+                    retry_attempt=retry_count,
+                    reason=failure_reason,
+                    on_log_event=on_log_event,
+                )
                 continue
-            return _build_fail_closed_answer_result(
+            result = _build_fail_closed_answer_result(
                 failure_reason,
                 retry_count=retry_count,
             )
+            emit_structured_log(
+                component=LOG_COMPONENT_PIPELINE,
+                event="answer_failed_closed",
+                run_id=resolved_run_id,
+                status=LOG_STATUS_FAILED,
+                level="WARNING",
+                message=(
+                    "Answer generation failed closed after payload validation "
+                    f"rejected the provider response as {failure_reason}."
+                ),
+                question_id=question_id,
+                retrieved_chunk_count=len(retrieved_chunks),
+                valid_citation_count=0,
+                answer_type=result.answer_type,
+                confidence_band=result.confidence_band,
+                review_status=result.status,
+                retry_attempt=result.retry_count,
+                reason=result.failure_reason,
+                on_log_event=on_log_event,
+            )
+            return result
 
         if not validation_result.citation_ids and validation_result.invalid_citation_ids:
-            return _build_fail_closed_answer_result(
+            result = _build_fail_closed_answer_result(
                 "no_valid_citations",
                 retry_count=retry_count,
             )
+            emit_structured_log(
+                component=LOG_COMPONENT_PIPELINE,
+                event="answer_failed_closed",
+                run_id=resolved_run_id,
+                status=LOG_STATUS_FAILED,
+                level="WARNING",
+                message=(
+                    "Answer generation failed closed because every cited chunk was "
+                    "invalid after validation."
+                ),
+                question_id=question_id,
+                retrieved_chunk_count=len(retrieved_chunks),
+                valid_citation_count=0,
+                answer_type=result.answer_type,
+                confidence_band=result.confidence_band,
+                review_status=result.status,
+                retry_attempt=result.retry_count,
+                reason=result.failure_reason,
+                on_log_event=on_log_event,
+            )
+            return result
 
         if validation_result.answer is None or validation_result.answer_type is None:
             raise RuntimeError(
@@ -2497,7 +2989,7 @@ def generate_answer_result(
             validation_result.answer_type,
             valid_citation_count=len(validation_result.citation_ids),
         )
-        return GeneratedAnswerResult(
+        result = GeneratedAnswerResult(
             answer=validation_result.answer,
             answer_type=validation_result.answer_type,
             citation_ids=validation_result.citation_ids,
@@ -2509,6 +3001,31 @@ def generate_answer_result(
             invalid_citation_ids=validation_result.invalid_citation_ids,
             retry_count=retry_count,
         )
+        emit_structured_log(
+            component=LOG_COMPONENT_PIPELINE,
+            event="answer_generated",
+            run_id=resolved_run_id,
+            status=LOG_STATUS_COMPLETED,
+            level=(
+                "WARNING"
+                if result.status == STATUS_NEEDS_REVIEW or result.failed_closed
+                else "INFO"
+            ),
+            message=(
+                f"Generated a {result.answer_type} answer with "
+                f"{len(result.citation_ids)} valid citations and routed the row to "
+                f"{result.status}."
+            ),
+            question_id=question_id,
+            retrieved_chunk_count=len(retrieved_chunks),
+            valid_citation_count=len(result.citation_ids),
+            answer_type=result.answer_type,
+            confidence_band=result.confidence_band,
+            review_status=result.status,
+            retry_attempt=result.retry_count if result.retry_count else None,
+            on_log_event=on_log_event,
+        )
+        return result
 
 
 def retrieve_evidence_chunks(
@@ -2980,9 +3497,32 @@ def publish_export_packet(
     output_dir: Path | None = None,
     completed_at: str | None = None,
     workspace_hash: str | None = None,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> PublishedExportPacket:
     """Stage and publish the export packet only from one coherent completed run."""
-    run_id, index_action = validate_completed_run_for_export(questionnaire)
+    best_effort_run_id = next(
+        (
+            str(row["run_id"]).strip()
+            for row in questionnaire.rows
+            if str(row.get("run_id", "")).strip()
+        ),
+        _default_log_run_id(LOG_COMPONENT_EXPORT, workspace_hash),
+    )
+    try:
+        run_id, index_action = validate_completed_run_for_export(questionnaire)
+    except ValueError as error:
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="export_blocked",
+            run_id=best_effort_run_id,
+            status=LOG_STATUS_BLOCKED,
+            level="ERROR",
+            message=f"Blocked export publication because {error}",
+            workspace_hash=workspace_hash.strip() if isinstance(workspace_hash, str) else None,
+            reason="validation_failed",
+            on_log_event=on_log_event,
+        )
+        raise
     resolved_output_dir = OUTPUTS_DIR if output_dir is None else Path(output_dir)
     resolved_output_dir.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2993,53 +3533,125 @@ def publish_export_packet(
     if not resolved_workspace_hash:
         raise ValueError("workspace_hash must be a non-empty string.")
 
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=(
-                f".{resolved_output_dir.name}-staging-"
-                f"{_safe_filesystem_token(run_id)}-"
-            ),
-            dir=resolved_output_dir.parent,
-        )
-    )
-    write_answered_questionnaire(questionnaire, output_dir=staging_dir)
-    write_review_summary(
-        questionnaire,
-        output_dir=staging_dir,
-        completed_at=completed_timestamp,
-        workspace_hash=resolved_workspace_hash,
-        index_action=index_action,
-    )
-    write_needs_review_csv(questionnaire, output_dir=staging_dir)
-
-    backup_dir: Path | None = None
-    if resolved_output_dir.exists():
-        backup_dir = resolved_output_dir.parent / (
-            f".{resolved_output_dir.name}-backup-"
-            f"{_safe_filesystem_token(run_id)}-"
-            f"{_safe_filesystem_token(completed_timestamp)}"
-        )
-        if backup_dir.exists():
-            raise FileExistsError(f"Backup output directory already exists at {backup_dir}.")
-        os.replace(resolved_output_dir, backup_dir)
-
     try:
-        os.replace(staging_dir, resolved_output_dir)
-    except Exception:
-        if backup_dir is not None and backup_dir.exists():
-            os.replace(backup_dir, resolved_output_dir)
-        raise
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="export_publish_started",
+            run_id=run_id,
+            status=LOG_STATUS_STARTED,
+            message="Publishing the completed export packet for the current run.",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            on_log_event=on_log_event,
+        )
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=(
+                    f".{resolved_output_dir.name}-staging-"
+                    f"{_safe_filesystem_token(run_id)}-"
+                ),
+                dir=resolved_output_dir.parent,
+            )
+        )
+        answered_path = write_answered_questionnaire(questionnaire, output_dir=staging_dir)
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="answered_questionnaire_written",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message="Wrote the answered questionnaire workbook into the staging packet.",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            artifact_path=answered_path,
+            on_log_event=on_log_event,
+        )
+        review_summary_path = write_review_summary(
+            questionnaire,
+            output_dir=staging_dir,
+            completed_at=completed_timestamp,
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+        )
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="review_summary_written",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message="Wrote the review summary markdown into the staging packet.",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            artifact_path=review_summary_path,
+            on_log_event=on_log_event,
+        )
+        needs_review_path = write_needs_review_csv(questionnaire, output_dir=staging_dir)
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="needs_review_csv_written",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message="Wrote the needs-review CSV into the staging packet.",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            artifact_path=needs_review_path,
+            on_log_event=on_log_event,
+        )
 
-    return PublishedExportPacket(
-        output_dir=resolved_output_dir,
-        answered_questionnaire_path=answered_questionnaire_output_path(resolved_output_dir),
-        review_summary_path=review_summary_output_path(resolved_output_dir),
-        needs_review_csv_path=needs_review_output_path(resolved_output_dir),
-        run_id=run_id,
-        completed_at=completed_timestamp,
-        workspace_hash=resolved_workspace_hash,
-        index_action=index_action,
-    )
+        backup_dir: Path | None = None
+        if resolved_output_dir.exists():
+            backup_dir = resolved_output_dir.parent / (
+                f".{resolved_output_dir.name}-backup-"
+                f"{_safe_filesystem_token(run_id)}-"
+                f"{_safe_filesystem_token(completed_timestamp)}"
+            )
+            if backup_dir.exists():
+                raise FileExistsError(
+                    f"Backup output directory already exists at {backup_dir}."
+                )
+            os.replace(resolved_output_dir, backup_dir)
+
+        try:
+            os.replace(staging_dir, resolved_output_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists():
+                os.replace(backup_dir, resolved_output_dir)
+            raise
+
+        packet = PublishedExportPacket(
+            output_dir=resolved_output_dir,
+            answered_questionnaire_path=answered_questionnaire_output_path(resolved_output_dir),
+            review_summary_path=review_summary_output_path(resolved_output_dir),
+            needs_review_csv_path=needs_review_output_path(resolved_output_dir),
+            run_id=run_id,
+            completed_at=completed_timestamp,
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+        )
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="export_published",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message="Published the final export packet to the runtime outputs directory.",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            artifact_path=packet.output_dir,
+            on_log_event=on_log_event,
+        )
+        return packet
+    except Exception as error:
+        emit_structured_log(
+            component=LOG_COMPONENT_EXPORT,
+            event="export_publish_failed",
+            run_id=run_id,
+            status=LOG_STATUS_FAILED,
+            level="ERROR",
+            message=f"Failed to publish the export packet because {error}",
+            workspace_hash=resolved_workspace_hash,
+            index_action=index_action,
+            reason=type(error).__name__.lower(),
+            on_log_event=on_log_event,
+        )
+        raise
 
 
 def prepare_questionnaire_run(
@@ -3111,13 +3723,54 @@ def run_questionnaire_answer_pipeline(
     model: str = DEFAULT_OPENAI_ANSWER_MODEL,
     openai_client: Any | None = None,
     on_row_completed: Callable[[RuntimeQuestionnaire, int], None] | None = None,
+    on_log_event: Callable[[dict[str, object]], None] | None = None,
 ) -> RuntimeQuestionnaire:
     """Fill one run-scoped questionnaire in order and expose incremental updates."""
     run_questionnaire = prepare_questionnaire_run(questionnaire)
+    workspace_hash = getattr(index_status, "workspace_hash", None)
+    emit_structured_log(
+        component=LOG_COMPONENT_PIPELINE,
+        event="pipeline_started",
+        run_id=run_id,
+        status=LOG_STATUS_STARTED,
+        message=(
+            f"Starting the questionnaire answer pipeline for "
+            f"{len(run_questionnaire.rows)} rows."
+        ),
+        workspace_hash=workspace_hash,
+        index_action=index_status.index_action,
+        on_log_event=on_log_event,
+    )
     for row_index, row in enumerate(run_questionnaire.rows):
+        question_id = _question_identifier(row)
+        emit_structured_log(
+            component=LOG_COMPONENT_PIPELINE,
+            event="row_started",
+            run_id=run_id,
+            status=LOG_STATUS_STARTED,
+            message=f"Starting row processing for {question_id}.",
+            question_id=question_id,
+            workspace_hash=workspace_hash,
+            index_action=index_status.index_action,
+            on_log_event=on_log_event,
+        )
         retrieved_chunks = retrieve_evidence_chunks_for_row(
             row,
             index_status=index_status,
+        )
+        emit_structured_log(
+            component=LOG_COMPONENT_PIPELINE,
+            event="row_retrieved",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            message=(
+                f"Retrieved {len(retrieved_chunks)} evidence chunks for {question_id}."
+            ),
+            question_id=question_id,
+            workspace_hash=workspace_hash,
+            index_action=index_status.index_action,
+            retrieved_chunk_count=len(retrieved_chunks),
+            on_log_event=on_log_event,
         )
         question_text = str(row["question"])
         answer_result = generate_answer_result(
@@ -3125,6 +3778,9 @@ def run_questionnaire_answer_pipeline(
             retrieved_chunks,
             model=model,
             openai_client=openai_client,
+            question_id=question_id,
+            run_id=run_id,
+            on_log_event=on_log_event,
         )
         updated_row = update_row_with_answer_result(
             row,
@@ -3133,8 +3789,56 @@ def run_questionnaire_answer_pipeline(
             run_id=run_id,
         )
         run_questionnaire.rows[row_index] = updated_row
+        emit_structured_log(
+            component=LOG_COMPONENT_PIPELINE,
+            event="row_completed",
+            run_id=run_id,
+            status=LOG_STATUS_COMPLETED,
+            level=(
+                "WARNING" if answer_result.status == STATUS_NEEDS_REVIEW else "INFO"
+            ),
+            message=(
+                f"Completed {question_id} as {answer_result.answer_type} with "
+                f"{len(answer_result.citation_ids)} valid citations; reviewer route is "
+                f"{answer_result.status}."
+            ),
+            question_id=question_id,
+            workspace_hash=workspace_hash,
+            index_action=index_status.index_action,
+            retrieved_chunk_count=len(retrieved_chunks),
+            valid_citation_count=len(answer_result.citation_ids),
+            answer_type=answer_result.answer_type,
+            confidence_band=answer_result.confidence_band,
+            review_status=answer_result.status,
+            retry_attempt=answer_result.retry_count if answer_result.retry_count else None,
+            reason=answer_result.failure_reason,
+            on_log_event=on_log_event,
+        )
         if on_row_completed is not None:
             on_row_completed(run_questionnaire, row_index)
+    ready_count = sum(
+        1
+        for row in run_questionnaire.rows
+        if str(row["status"]) == STATUS_READY_FOR_REVIEW
+    )
+    review_count = sum(
+        1
+        for row in run_questionnaire.rows
+        if str(row["status"]) == STATUS_NEEDS_REVIEW
+    )
+    emit_structured_log(
+        component=LOG_COMPONENT_PIPELINE,
+        event="pipeline_completed",
+        run_id=run_id,
+        status=LOG_STATUS_COMPLETED,
+        message=(
+            f"Completed the questionnaire answer pipeline with {ready_count} rows "
+            f"ready for review and {review_count} rows needing review."
+        ),
+        workspace_hash=workspace_hash,
+        index_action=index_status.index_action,
+        on_log_event=on_log_event,
+    )
     return run_questionnaire
 
 
