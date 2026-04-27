@@ -108,6 +108,9 @@ SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE: Final[float] = 0.90
 PARTIAL_SCORE: Final[float] = 0.55
 UNSUPPORTED_SCORE: Final[float] = 0.30
 FAIL_CLOSED_SCORE: Final[float] = 0.25
+FAIL_CLOSED_ANSWER: Final[str] = (
+    "Not stated. The available evidence does not support a reliable answer."
+)
 HIGH_CONFIDENCE_THRESHOLD: Final[float] = 0.85
 MEDIUM_CONFIDENCE_THRESHOLD: Final[float] = 0.60
 REVIEW_QUEUE_THRESHOLD: Final[float] = 0.75
@@ -146,6 +149,27 @@ ANSWER_PAYLOAD_OUTCOME_ACCEPTED_WITH_CITATION_IDS_REMOVED: Final[str] = (
 )
 ANSWER_PAYLOAD_OUTCOME_REJECTED: Final[str] = "rejected"
 FALLBACK_REVIEWER_NOTE: Final[str] = "Model response requires manual review."
+FAILURE_REASON_NO_RETRIEVAL: Final[str] = "no_retrieval"
+FAILURE_REASON_MODEL_OUTPUT_INVALID: Final[str] = "model_output_invalid"
+RETRYABLE_VALIDATION_FAILURE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "payload_shape_invalid",
+        "answer_invalid",
+        "answer_type_invalid",
+        "citation_ids_invalid",
+    }
+)
+FAIL_CLOSED_REVIEWER_NOTE_BY_REASON: Final[Mapping[str, str]] = {
+    FAILURE_REASON_NO_RETRIEVAL: "No relevant evidence was retrieved; review manually.",
+    FAILURE_REASON_MODEL_OUTPUT_INVALID: (
+        "Model output was unusable after retry; review manually."
+    ),
+    "payload_shape_invalid": "Model output failed validation after retry; review manually.",
+    "answer_invalid": "Model answer text was unusable after retry; review manually.",
+    "answer_type_invalid": "Model answer type was unusable after retry; review manually.",
+    "citation_ids_invalid": "Model citations were unusable after retry; review manually.",
+    "no_valid_citations": "All cited evidence was invalid; review manually.",
+}
 
 INDEX_ACTION_CREATED: Final[str] = "created"
 INDEX_ACTION_REUSED: Final[str] = "reused"
@@ -509,6 +533,24 @@ class AnswerConfidenceResult:
     confidence_score: float
     confidence_band: str
     status: str
+
+
+@dataclass(frozen=True)
+class GeneratedAnswerResult:
+    """One completed answer decision for a single question and evidence set."""
+
+    answer: str
+    answer_type: str
+    citation_ids: tuple[str, ...]
+    citations: tuple[ResolvedEvidenceCitation, ...]
+    confidence_score: float
+    confidence_band: str
+    status: str
+    reviewer_note: str
+    invalid_citation_ids: tuple[str, ...] = ()
+    failed_closed: bool = False
+    failure_reason: str | None = None
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -2278,6 +2320,130 @@ def resolve_validated_citations(
     return tuple(resolved_citations)
 
 
+def _fail_closed_reviewer_note(failure_reason: str) -> str:
+    """Return the short reviewer-facing rationale for one fail-closed reason."""
+    return FAIL_CLOSED_REVIEWER_NOTE_BY_REASON.get(
+        failure_reason,
+        "Answer generation failed safely; review manually.",
+    )
+
+
+def _build_fail_closed_answer_result(
+    failure_reason: str,
+    *,
+    retry_count: int,
+) -> GeneratedAnswerResult:
+    """Return the exact fail-closed answer package for one row-level failure."""
+    confidence = score_answer_confidence(
+        ANSWER_TYPE_UNSUPPORTED,
+        valid_citation_count=0,
+    )
+    return GeneratedAnswerResult(
+        answer=FAIL_CLOSED_ANSWER,
+        answer_type=ANSWER_TYPE_UNSUPPORTED,
+        citation_ids=(),
+        citations=(),
+        confidence_score=confidence.confidence_score,
+        confidence_band=confidence.confidence_band,
+        status=confidence.status,
+        reviewer_note=_fail_closed_reviewer_note(failure_reason),
+        failed_closed=True,
+        failure_reason=failure_reason,
+        retry_count=retry_count,
+    )
+
+
+def _is_retryable_generation_error(error: RuntimeError) -> bool:
+    """Return whether one answer-generation runtime error is safe to retry once."""
+    return str(error).startswith("OpenAI answer generation returned ")
+
+
+def _should_retry_validation_failure(failure_reason: str | None) -> bool:
+    """Return whether one validation failure should consume the single retry."""
+    return failure_reason in RETRYABLE_VALIDATION_FAILURE_REASONS
+
+
+def generate_answer_result(
+    question_text: str,
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+    *,
+    model: str = DEFAULT_OPENAI_ANSWER_MODEL,
+    openai_client: Any | None = None,
+) -> GeneratedAnswerResult:
+    """Generate one answer result with fail-closed routing and at most one retry."""
+    if not retrieved_chunks:
+        return _build_fail_closed_answer_result(
+            FAILURE_REASON_NO_RETRIEVAL,
+            retry_count=0,
+        )
+
+    retry_count = 0
+    while True:
+        try:
+            payload = generate_answer_payload(
+                question_text,
+                retrieved_chunks,
+                model=model,
+                openai_client=openai_client,
+            )
+        except RuntimeError as error:
+            if _is_retryable_generation_error(error):
+                if retry_count < MODEL_RETRY_LIMIT:
+                    retry_count += 1
+                    continue
+                return _build_fail_closed_answer_result(
+                    FAILURE_REASON_MODEL_OUTPUT_INVALID,
+                    retry_count=retry_count,
+                )
+            raise
+
+        validation_result = validate_answer_payload(payload, retrieved_chunks)
+        if not validation_result.usable:
+            failure_reason = validation_result.failure_reason or "payload_shape_invalid"
+            if (
+                _should_retry_validation_failure(failure_reason)
+                and retry_count < MODEL_RETRY_LIMIT
+            ):
+                retry_count += 1
+                continue
+            return _build_fail_closed_answer_result(
+                failure_reason,
+                retry_count=retry_count,
+            )
+
+        if not validation_result.citation_ids and validation_result.invalid_citation_ids:
+            return _build_fail_closed_answer_result(
+                "no_valid_citations",
+                retry_count=retry_count,
+            )
+
+        if validation_result.answer is None or validation_result.answer_type is None:
+            raise RuntimeError(
+                "validate_answer_payload returned a usable result without answer fields."
+            )
+
+        resolved_citations = resolve_validated_citations(
+            validation_result.citation_ids,
+            retrieved_chunks,
+        )
+        confidence = score_answer_confidence(
+            validation_result.answer_type,
+            valid_citation_count=len(validation_result.citation_ids),
+        )
+        return GeneratedAnswerResult(
+            answer=validation_result.answer,
+            answer_type=validation_result.answer_type,
+            citation_ids=validation_result.citation_ids,
+            citations=resolved_citations,
+            confidence_score=confidence.confidence_score,
+            confidence_band=confidence.confidence_band,
+            status=confidence.status,
+            reviewer_note=validation_result.reviewer_note,
+            invalid_citation_ids=validation_result.invalid_citation_ids,
+            retry_count=retry_count,
+        )
+
+
 def retrieve_evidence_chunks(
     question_text: str,
     *,
@@ -2644,8 +2810,12 @@ __all__ = [
     "EXPECTED_EVIDENCE_FILE_NAMES",
     "EXPECTED_QUESTION_IDS",
     "FAIL_CLOSED_SCORE",
+    "FAIL_CLOSED_ANSWER",
     "FALLBACK_REVIEWER_NOTE",
+    "FAILURE_REASON_MODEL_OUTPUT_INVALID",
+    "FAILURE_REASON_NO_RETRIEVAL",
     "FULL_LOCAL_VALIDATION_COMMAND_NAMES",
+    "GeneratedAnswerResult",
     "HIGH_CONFIDENCE_THRESHOLD",
     "INCIDENT_RESPONSE_POLICY_FILE_NAME",
     "INDEX_ACTION_BLOCKED",
@@ -2746,6 +2916,7 @@ __all__ = [
     "evaluate_chroma_reuse",
     "format_retrieved_chunk_for_prompt",
     "generate_answer_payload",
+    "generate_answer_result",
     "get_existing_chroma_collection",
     "get_or_create_chroma_collection",
     "get_or_create_demo_chroma_collection",
