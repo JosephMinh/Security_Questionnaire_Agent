@@ -433,6 +433,20 @@ class RetrievedEvidenceChunk:
 
 
 @dataclass(frozen=True)
+class ResolvedEvidenceCitation:
+    """One reviewer-facing citation with a friendly label and literal snippet text."""
+
+    chunk_id: str
+    display_label: str
+    snippet_text: str
+    source: str
+    source_path: Path
+    doc_type: str
+    section: str | None = None
+    page: int | None = None
+
+
+@dataclass(frozen=True)
 class ChromaCollectionHandle:
     """One stable handle to the demo's persistent Chroma collection."""
 
@@ -2172,6 +2186,51 @@ def validate_answer_payload(
     )
 
 
+def resolve_validated_citations(
+    citation_ids: Sequence[str],
+    retrieved_chunks: Sequence[RetrievedEvidenceChunk],
+    *,
+    max_visible: int = MAX_VISIBLE_CITATIONS,
+) -> tuple[ResolvedEvidenceCitation, ...]:
+    """Resolve validated citation ids into shared reviewer-facing evidence objects."""
+    if max_visible <= 0:
+        raise ValueError("max_visible must be a positive integer.")
+
+    retrieved_chunks_by_id = {
+        retrieved_chunk.chunk_id: retrieved_chunk for retrieved_chunk in retrieved_chunks
+    }
+    resolved_citations: list[ResolvedEvidenceCitation] = []
+    for citation_id in citation_ids:
+        if len(resolved_citations) >= max_visible:
+            break
+
+        retrieved_chunk = retrieved_chunks_by_id.get(citation_id)
+        if retrieved_chunk is None:
+            raise ValueError(
+                "Validated citation id "
+                f"{citation_id!r} was not present in the retrieved chunk set."
+            )
+
+        resolved_citations.append(
+            ResolvedEvidenceCitation(
+                chunk_id=retrieved_chunk.chunk_id,
+                display_label=build_citation_display_label(
+                    retrieved_chunk.source,
+                    retrieved_chunk.section,
+                    retrieved_chunk.page,
+                ),
+                snippet_text=retrieved_chunk.text,
+                source=retrieved_chunk.source,
+                source_path=retrieved_chunk.source_path,
+                doc_type=retrieved_chunk.doc_type,
+                section=retrieved_chunk.section,
+                page=retrieved_chunk.page,
+            )
+        )
+
+    return tuple(resolved_citations)
+
+
 def retrieve_evidence_chunks(
     question_text: str,
     *,
@@ -2590,6 +2649,7 @@ __all__ = [
     "REVIEW_QUEUE_THRESHOLD",
     "REVIEW_STATUS_FILL",
     "REVIEW_SUMMARY_FILE_NAME",
+    "ResolvedEvidenceCitation",
     "RetrievedEvidenceChunk",
     "RUNTIME_DIRECTORIES",
     "RUNTIME_EVIDENCE_DIR",
@@ -2658,6 +2718,7 @@ __all__ = [
     "record_indexed_workspace_state",
     "retrieve_evidence_chunks",
     "retrieve_evidence_chunks_for_row",
+    "resolve_validated_citations",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
     "runtime_evidence_directory",
