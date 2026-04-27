@@ -668,11 +668,14 @@ class RagAnswerPipelineTest(unittest.TestCase):
                     )
 
                 self.assertFalse(result.failed_closed)
+                self.assertEqual(result.retry_count, 0)
+                self.assertEqual(result.invalid_citation_ids, ())
                 self.assertEqual(result.answer_type, str(question["expected_answer_type"]))
                 self.assertTrue(result.answer.startswith(str(question["expected_opening_token"])))
                 self.assertEqual(result.status, str(question["expected_status"]))
                 self.assertIn(result.confidence_band, tuple(question["allowed_confidence_bands"]))
                 if question_id == "Q19":
+                    self.assertEqual(result.confidence_score, rag.FAIL_CLOSED_SCORE)
                     self.assertEqual(result.reviewer_note, rag.FALLBACK_REVIEWER_NOTE)
                     self.assertEqual(result.citations, ())
                 else:
