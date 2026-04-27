@@ -310,7 +310,7 @@ class AppRunSectionTest(unittest.TestCase):
                 "Sources Indexed": "5",
             },
         )
-        self.assertEqual(len(at.dataframe), 1)
+        self.assertEqual(len(at.dataframe), 2)
         dataframe = at.dataframe[0].value
         self.assertEqual(
             list(dataframe.columns),
@@ -325,6 +325,12 @@ class AppRunSectionTest(unittest.TestCase):
                 rag.STATUS_READY_FOR_REVIEW,
             ],
         )
+        review_queue_dataframe = at.dataframe[1].value
+        self.assertEqual(
+            list(review_queue_dataframe.columns),
+            list(rag.REVIEW_QUEUE_COLUMNS),
+        )
+        self.assertEqual(list(review_queue_dataframe["Question ID"]), ["Q02"])
         self.assertIn(
             "Completed 3 of 3 questions.",
             [caption.value for caption in at.caption],
@@ -422,6 +428,139 @@ class AppRunSectionTest(unittest.TestCase):
         )
         self.assertNotIn(app.RESULTS_QUESTIONNAIRE_KEY, at.session_state)
         self.assertNotIn(app.LAST_RUN_ID_KEY, at.session_state)
+
+    def test_results_surface_defaults_to_lowest_confidence_needs_review_and_sorts_queue(
+        self,
+    ) -> None:
+        """Finished runs should focus the weakest Needs Review row and sort the queue by score."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            ),
+            _runtime_row(
+                question_id="Q02",
+                category="Backups",
+                question="Are backups encrypted?",
+            ),
+            _runtime_row(
+                question_id="Q03",
+                category="Access",
+                question="Do you review privileged access?",
+            ),
+            _runtime_row(
+                question_id="Q04",
+                category="Monitoring",
+                question="Do you monitor backup failures?",
+            ),
+        )
+        results_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        row_updates = (
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_HIGH,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            _answer_result(
+                answer="Partially. Backup coverage is narrower than the full estate.",
+                answer_type=rag.ANSWER_TYPE_PARTIAL,
+                confidence_score=0.70,
+                confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                status=rag.STATUS_NEEDS_REVIEW,
+                reviewer_note="Review the backup scope exceptions.",
+            ),
+            _answer_result(
+                answer="Not stated with enough support.",
+                answer_type=rag.ANSWER_TYPE_UNSUPPORTED,
+                confidence_score=rag.PARTIAL_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_LOW,
+                status=rag.STATUS_NEEDS_REVIEW,
+                reviewer_note="Manual confirmation required.",
+            ),
+            _answer_result(
+                answer="Yes. Backup failures are monitored by the operations team.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=0.70,
+                confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+        )
+        for row_index, answer_result in enumerate(row_updates):
+            results_questionnaire.rows[row_index] = rag.update_row_with_answer_result(
+                results_questionnaire.rows[row_index],
+                answer_result,
+                index_action=rag.INDEX_ACTION_REUSED,
+                run_id="demo-run-003",
+            )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = results_questionnaire
+                    at.run()
+
+        inspector_selectbox = at.selectbox[0]
+        self.assertEqual(inspector_selectbox.value, "Q03")
+        review_queue_dataframe = at.dataframe[1].value
+        self.assertEqual(list(review_queue_dataframe["Question ID"]), ["Q03", "Q02", "Q04"])
+
+    def test_results_surface_defaults_to_first_question_when_no_needs_review_exists(
+        self,
+    ) -> None:
+        """Finished runs without review rows should default back to the first question."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            ),
+            _runtime_row(
+                question_id="Q02",
+                category="Backups",
+                question="Are backups encrypted?",
+            ),
+        )
+        results_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        results_questionnaire.rows[0] = rag.update_row_with_answer_result(
+            results_questionnaire.rows[0],
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_HIGH,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-004",
+        )
+        results_questionnaire.rows[1] = rag.update_row_with_answer_result(
+            results_questionnaire.rows[1],
+            _answer_result(
+                answer="Yes. Backup jobs are encrypted.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=0.74,
+                confidence_band=rag.CONFIDENCE_BAND_LOW,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-004",
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = results_questionnaire
+                    at.run()
+
+        inspector_selectbox = at.selectbox[0]
+        self.assertEqual(inspector_selectbox.value, "Q01")
+        review_queue_dataframe = at.dataframe[1].value
+        self.assertEqual(list(review_queue_dataframe["Question ID"]), ["Q02"])
 
     def test_results_surface_question_inspector_shows_provenance_and_switches_rows(
         self,

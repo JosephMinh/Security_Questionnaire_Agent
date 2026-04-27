@@ -30,6 +30,8 @@ from rag import (
     INDEX_ACTION_REUSED,
     REPO_ROOT,
     REQUIRED_ENV_VARS,
+    REVIEW_QUEUE_COLUMNS,
+    REVIEW_QUEUE_THRESHOLD,
     ResolvedEvidenceCitation,
     RuntimeQuestionnaire,
     STATUS_NEEDS_REVIEW,
@@ -501,6 +503,54 @@ def _processed_result_rows(
     return tuple(row for row in questionnaire.rows if _row_has_visible_results(row))
 
 
+def _confidence_score_for_row(row_like: Mapping[str, object]) -> float:
+    """Return one row confidence score as a float for sorting and filtering."""
+    try:
+        return float(row_like.get("confidence_score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _review_queue_rows(
+    questionnaire: RuntimeQuestionnaire,
+) -> tuple[Mapping[str, object], ...]:
+    """Return the filtered review queue in stable reviewer-priority order."""
+    queue_rows = [
+        row
+        for row in _processed_result_rows(questionnaire)
+        if str(row.get("Status", "")) == STATUS_NEEDS_REVIEW
+        or _confidence_score_for_row(row) < REVIEW_QUEUE_THRESHOLD
+    ]
+    return tuple(
+        sorted(
+            queue_rows,
+            key=lambda row: (_confidence_score_for_row(row), str(row["Question ID"])),
+        )
+    )
+
+
+def _default_inspector_question_id(questionnaire: RuntimeQuestionnaire) -> str:
+    """Return the default question id for the current results state."""
+    processed_rows = _processed_result_rows(questionnaire)
+    if not processed_rows:
+        raise ValueError("questionnaire must contain at least one processed row.")
+
+    run_finished = len(processed_rows) == len(questionnaire.rows)
+    if not run_finished:
+        return str(processed_rows[0]["Question ID"])
+
+    needs_review_rows = [
+        row for row in processed_rows if str(row.get("Status", "")) == STATUS_NEEDS_REVIEW
+    ]
+    if needs_review_rows:
+        prioritized_row = min(
+            needs_review_rows,
+            key=lambda row: (_confidence_score_for_row(row), str(row["Question ID"])),
+        )
+        return str(prioritized_row["Question ID"])
+    return str(questionnaire.rows[0]["Question ID"])
+
+
 def _status_badge_markup(status: str) -> str:
     """Return one compact HTML badge for the current row status."""
     normalized_status = status.strip() or "Pending"
@@ -534,7 +584,9 @@ def _render_question_inspector(questionnaire: RuntimeQuestionnaire) -> None:
 
     question_ids = [str(row["Question ID"]) for row in processed_rows]
     if st.session_state.get(QUESTION_INSPECTOR_SELECTION_KEY) not in question_ids:
-        st.session_state.pop(QUESTION_INSPECTOR_SELECTION_KEY, None)
+        st.session_state[QUESTION_INSPECTOR_SELECTION_KEY] = _default_inspector_question_id(
+            questionnaire
+        )
 
     st.markdown("**Question Inspector**")
     selected_question_id = st.selectbox(
@@ -573,6 +625,21 @@ def _render_question_inspector(questionnaire: RuntimeQuestionnaire) -> None:
         st.markdown(_status_badge_markup(str(selected_row["Status"])), unsafe_allow_html=True)
         st.markdown("**Reviewer Note**")
         st.markdown(str(selected_row["Reviewer Notes"]))
+
+    review_queue_rows = _review_queue_rows(questionnaire)
+    if not review_queue_rows:
+        return
+
+    st.markdown("**Review Queue**")
+    st.caption(
+        "Sorted by lowest confidence score first; includes explicit Needs Review rows and "
+        f"other processed rows below {REVIEW_QUEUE_THRESHOLD:.2f} confidence."
+    )
+    review_queue_table_rows = [
+        {column: str(row[column]) for column in REVIEW_QUEUE_COLUMNS}
+        for row in review_queue_rows
+    ]
+    st.dataframe(review_queue_table_rows, hide_index=True, width="stretch")
 
 
 def _render_results_surface(
