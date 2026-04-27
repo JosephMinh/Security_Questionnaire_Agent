@@ -150,6 +150,11 @@ CURATED_TEXT_EVIDENCE_FILE_NAMES: Final[tuple[str, ...]] = tuple(
     for evidence_file_name in EXPECTED_EVIDENCE_FILE_NAMES
     if Path(evidence_file_name).suffix.lower() in TEXT_EVIDENCE_SUFFIXES
 )
+CURATED_PDF_EVIDENCE_FILE_NAMES: Final[tuple[str, ...]] = tuple(
+    evidence_file_name
+    for evidence_file_name in EXPECTED_EVIDENCE_FILE_NAMES
+    if Path(evidence_file_name).suffix.lower() == ".pdf"
+)
 
 RUNTIME_DIRECTORIES: Final[tuple[Path, ...]] = (
     RUNTIME_QUESTIONNAIRES_DIR,
@@ -743,6 +748,57 @@ def load_curated_text_evidence_documents(
     )
 
 
+def load_pdf_evidence_pages(source_path: Path) -> tuple[EvidenceDocument, ...]:
+    """Load one text-based PDF into page-aware evidence documents via pypdf."""
+    if source_path.suffix.lower() != ".pdf":
+        raise ValueError(
+            f"Unsupported PDF evidence file type for {source_path.name}: expected .pdf."
+        )
+
+    try:
+        from pypdf import PdfReader
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "pypdf is required to extract text from the bundled SOC 2 PDF. Install the "
+            "project requirements with `pip install -r requirements.txt` before calling "
+            "`load_pdf_evidence_pages()`."
+        ) from exc
+
+    reader = PdfReader(str(source_path))
+    page_documents: list[EvidenceDocument] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        if not page_text.strip():
+            continue
+        page_documents.append(
+            EvidenceDocument(
+                source_file_name=source_path.name,
+                source_path=source_path,
+                doc_type=DOCUMENT_TYPE_PDF,
+                text=page_text,
+                page_number=page_number,
+            )
+        )
+
+    if not page_documents:
+        raise ValueError(
+            f"PDF evidence file {source_path.name} did not yield any extractable text "
+            "via pypdf."
+        )
+    return tuple(page_documents)
+
+
+def load_curated_pdf_evidence_documents(
+    evidence_dir: Path | None = None,
+) -> tuple[EvidenceDocument, ...]:
+    """Load the curated SOC 2 PDF into page-aware evidence documents."""
+    base_directory = evidence_dir or runtime_evidence_directory()
+    page_documents: list[EvidenceDocument] = []
+    for evidence_file_name in CURATED_PDF_EVIDENCE_FILE_NAMES:
+        page_documents.extend(load_pdf_evidence_pages(base_directory / evidence_file_name))
+    return tuple(page_documents)
+
+
 def _parse_evidence_display_value(value: str) -> list[str]:
     """Split the friendly workbook evidence cell into individual labels."""
     return [label for label in value.split("; ") if label]
@@ -923,6 +979,8 @@ __all__ = [
     "CONFIDENCE_BAND_LOW",
     "CONFIDENCE_BAND_MEDIUM",
     "CLOSEOUT_AUDIT_RULES",
+    "CURATED_PDF_EVIDENCE_FILE_NAMES",
+    "CURATED_TEXT_EVIDENCE_FILE_NAMES",
     "DATA_DIR",
     "DEMO_MODE_LABEL",
     "DOCUMENT_TYPE_MARKDOWN",
@@ -977,7 +1035,6 @@ __all__ = [
     "OPTIONAL_LIVE_VALIDATION_COMMAND_NAMES",
     "OUTPUTS_DIR",
     "PARTIAL_SCORE",
-    "CURATED_TEXT_EVIDENCE_FILE_NAMES",
     "QUESTIONNAIRE_FILE_NAME",
     "QUESTION_SHEET_NAME",
     "QUICK_CONFIDENCE_COMMAND_NAMES",
@@ -1023,7 +1080,9 @@ __all__ = [
     "build_citation_display_label",
     "build_evidence_display_value",
     "confidence_band_for_score",
+    "load_curated_pdf_evidence_documents",
     "load_curated_text_evidence_documents",
+    "load_pdf_evidence_pages",
     "load_runtime_questionnaire",
     "load_text_evidence_document",
     "make_result_row_defaults",
