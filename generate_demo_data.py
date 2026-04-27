@@ -116,14 +116,13 @@ def iter_runtime_files(root_directory: Path) -> tuple[Path, ...]:
     )
 
 
-def runtime_file_names(directory: Path) -> set[str]:
-    """Return the non-gitkeep file names currently present in one runtime directory."""
+def runtime_relative_file_names(directory: Path) -> set[str]:
+    """Return the non-gitkeep runtime file paths relative to one workspace directory."""
     if not directory.exists():
         return set()
     return {
-        path.name
-        for path in directory.iterdir()
-        if path.is_file() and path.name != ".gitkeep"
+        str(path.relative_to(directory))
+        for path in iter_runtime_files(directory)
     }
 
 
@@ -206,7 +205,7 @@ def validate_questionnaire_workbook() -> tuple[ValidationIssue, ...]:
         "Rerun `python generate_demo_data.py` to restore the curated workbook from seed data."
     )
     issues: list[ValidationIssue] = []
-    existing_file_names = runtime_file_names(RUNTIME_QUESTIONNAIRES_DIR)
+    existing_file_names = runtime_relative_file_names(RUNTIME_QUESTIONNAIRES_DIR)
     unexpected_file_names = sorted(existing_file_names - {QUESTIONNAIRE_FILE_NAME})
     for file_name in unexpected_file_names:
         issues.append(
@@ -429,7 +428,7 @@ def validate_runtime_evidence_files() -> tuple[ValidationIssue, ...]:
     recovery_hint = (
         "Rerun `python generate_demo_data.py` to repopulate the curated evidence workspace."
     )
-    existing_file_names = runtime_file_names(RUNTIME_EVIDENCE_DIR)
+    existing_file_names = runtime_relative_file_names(RUNTIME_EVIDENCE_DIR)
     expected_file_names = set(EXPECTED_EVIDENCE_FILE_NAMES)
 
     missing_file_names = sorted(expected_file_names - existing_file_names)

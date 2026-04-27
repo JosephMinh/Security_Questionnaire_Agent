@@ -154,8 +154,16 @@ class GenerateDemoDataTest(unittest.TestCase):
                 gdd.RUNTIME_QUESTIONNAIRES_DIR / "Unexpected_Workbook.xlsx"
             )
             unexpected_questionnaire.write_text("stale workbook", encoding="utf-8")
+            unexpected_questionnaire_nested = (
+                gdd.RUNTIME_QUESTIONNAIRES_DIR / "archive" / "Unexpected_Workbook.xlsx"
+            )
+            unexpected_questionnaire_nested.parent.mkdir()
+            unexpected_questionnaire_nested.write_text("stale nested workbook", encoding="utf-8")
             unexpected_evidence = gdd.RUNTIME_EVIDENCE_DIR / "Unexpected.txt"
             unexpected_evidence.write_text("stale evidence", encoding="utf-8")
+            unexpected_evidence_nested = gdd.RUNTIME_EVIDENCE_DIR / "archive" / "Unexpected.txt"
+            unexpected_evidence_nested.parent.mkdir()
+            unexpected_evidence_nested.write_text("stale nested evidence", encoding="utf-8")
             missing_evidence = gdd.expected_runtime_evidence_paths()[0]
             missing_evidence.unlink()
 
@@ -163,7 +171,9 @@ class GenerateDemoDataTest(unittest.TestCase):
 
             self.assertEqual(len(copied_assets), 6)
             self.assertFalse(unexpected_questionnaire.exists())
+            self.assertFalse(unexpected_questionnaire_nested.exists())
             self.assertFalse(unexpected_evidence.exists())
+            self.assertFalse(unexpected_evidence_nested.exists())
             self.assertTrue(gdd.questionnaire_path().exists())
             for evidence_path in gdd.expected_runtime_evidence_paths():
                 self.assertTrue(evidence_path.exists())
@@ -194,6 +204,28 @@ class GenerateDemoDataTest(unittest.TestCase):
             rendered_issues = "\n".join(issue.render() for issue in context.exception.issues)
             self.assertIn("curated runtime evidence file is missing", rendered_issues)
             self.assertIn("Recovery:", rendered_issues)
+
+    def test_validate_runtime_workspace_reports_nested_unexpected_runtime_files(self):
+        """Nested runtime artifacts should still be treated as unexpected workspace drift."""
+        with self.isolated_workspace():
+            gdd.prepare_demo_workspace(reset_index=False)
+            unexpected_questionnaire = (
+                gdd.RUNTIME_QUESTIONNAIRES_DIR / "archive" / "Unexpected.xlsx"
+            )
+            unexpected_questionnaire.parent.mkdir()
+            unexpected_questionnaire.write_text("nested workbook", encoding="utf-8")
+            unexpected_evidence = gdd.RUNTIME_EVIDENCE_DIR / "archive" / "Unexpected.txt"
+            unexpected_evidence.parent.mkdir()
+            unexpected_evidence.write_text("nested evidence", encoding="utf-8")
+
+            with self.assertRaises(gdd.WorkspaceValidationError) as context:
+                gdd.validate_runtime_workspace()
+
+            rendered_issues = "\n".join(issue.render() for issue in context.exception.issues)
+            self.assertIn("questionnaires/archive/Unexpected.xlsx", rendered_issues)
+            self.assertIn("evidence/archive/Unexpected.txt", rendered_issues)
+            self.assertIn("Unexpected runtime questionnaire file present", rendered_issues)
+            self.assertIn("Unexpected runtime evidence file present", rendered_issues)
 
     def test_validate_questionnaire_workbook_closes_read_only_workbook_handle(self):
         """Workbook validation should always close the openpyxl handle after inspection."""
