@@ -28,6 +28,7 @@ from rag import (
     INDEX_ACTION_REBUILT_CONTENT_CHANGE,
     INDEX_ACTION_REBUILT_INTEGRITY,
     INDEX_ACTION_REUSED,
+    PublishedExportPacket,
     REPO_ROOT,
     REQUIRED_ENV_VARS,
     REVIEW_QUEUE_COLUMNS,
@@ -40,6 +41,7 @@ from rag import (
     ensure_curated_evidence_index,
     evaluate_chroma_reuse,
     load_runtime_questionnaire,
+    publish_export_packet,
     run_questionnaire_answer_pipeline,
 )
 
@@ -50,6 +52,9 @@ RESULTS_QUESTIONNAIRE_KEY = "results_questionnaire"
 QUESTION_INSPECTOR_SELECTION_KEY = "question_inspector_selection"
 RUN_BUSY_KEY = "run_busy"
 RUN_ACTION_FEEDBACK_KEY = "run_action_feedback"
+EXPORT_PACKET_KEY = "export_packet"
+EXPORT_BUSY_KEY = "export_busy"
+EXPORT_ACTION_FEEDBACK_KEY = "export_action_feedback"
 WORKSPACE_BUSY_KEY = "workspace_busy"
 WORKSPACE_ACTION_FEEDBACK_KEY = "workspace_action_feedback"
 
@@ -295,6 +300,17 @@ def _persist_run_feedback(feedback: ActionFeedback) -> None:
     st.session_state[RUN_ACTION_FEEDBACK_KEY] = feedback
 
 
+def _persist_export_feedback(feedback: ActionFeedback) -> None:
+    """Store one export-feedback block across reruns."""
+    st.session_state[EXPORT_ACTION_FEEDBACK_KEY] = feedback
+
+
+def _clear_export_ui_state() -> None:
+    """Remove any persisted export packet or export feedback state."""
+    st.session_state.pop(EXPORT_PACKET_KEY, None)
+    st.session_state.pop(EXPORT_ACTION_FEEDBACK_KEY, None)
+
+
 def _clear_run_ui_state() -> None:
     """Remove stale run outputs, ids, and feedback after a workflow transition."""
     st.session_state.pop(LAST_RUN_ID_KEY, None)
@@ -302,6 +318,7 @@ def _clear_run_ui_state() -> None:
     st.session_state.pop(RESULTS_QUESTIONNAIRE_KEY, None)
     st.session_state.pop(QUESTION_INSPECTOR_SELECTION_KEY, None)
     st.session_state.pop(RUN_ACTION_FEEDBACK_KEY, None)
+    _clear_export_ui_state()
 
 
 def _clear_last_run() -> None:
@@ -314,6 +331,14 @@ def _persist_last_run(questionnaire: RuntimeQuestionnaire, *, run_id: str) -> No
     """Store the most recent completed questionnaire run in session state."""
     st.session_state[LAST_RUN_ID_KEY] = run_id
     st.session_state[LAST_RUN_QUESTIONNAIRE_KEY] = questionnaire
+
+
+def _last_run_questionnaire() -> RuntimeQuestionnaire | None:
+    """Return the most recent completed questionnaire run."""
+    questionnaire = st.session_state.get(LAST_RUN_QUESTIONNAIRE_KEY)
+    if isinstance(questionnaire, RuntimeQuestionnaire):
+        return questionnaire
+    return None
 
 
 def _clear_results_questionnaire() -> None:
@@ -342,6 +367,24 @@ def _workspace_busy() -> bool:
 def _run_busy() -> bool:
     """Return whether one questionnaire run is currently running."""
     return bool(st.session_state.get(RUN_BUSY_KEY, False))
+
+
+def _export_busy() -> bool:
+    """Return whether one export action is currently running."""
+    return bool(st.session_state.get(EXPORT_BUSY_KEY, False))
+
+
+def _persist_export_packet(packet: PublishedExportPacket) -> None:
+    """Store the most recent published export packet in session state."""
+    st.session_state[EXPORT_PACKET_KEY] = packet
+
+
+def _export_packet() -> PublishedExportPacket | None:
+    """Return the most recent published export packet if one exists."""
+    packet = st.session_state.get(EXPORT_PACKET_KEY)
+    if isinstance(packet, PublishedExportPacket):
+        return packet
+    return None
 
 
 def _load_repo_env_if_available() -> None:
@@ -685,6 +728,88 @@ def _render_results_surface(
             _render_question_inspector(questionnaire)
 
 
+def _publish_export_packet_feedback(
+    workspace_snapshot: WorkspaceSnapshot,
+) -> ActionFeedback:
+    """Publish one coherent export packet for the last completed run."""
+    questionnaire = _last_run_questionnaire()
+    if questionnaire is None:
+        return ActionFeedback(
+            level="warning",
+            title="Export packet is blocked.",
+            lines=("Finish a copilot run before publishing the export packet.",),
+        )
+    if not workspace_snapshot.workspace_hash:
+        return ActionFeedback(
+            level="warning",
+            title="Export packet is blocked.",
+            lines=(
+                "The current workspace hash is unavailable.",
+                "Reload the demo workspace before exporting this run.",
+            ),
+        )
+
+    try:
+        packet = publish_export_packet(
+            questionnaire,
+            workspace_hash=workspace_snapshot.workspace_hash,
+        )
+    except ValueError as exc:
+        return ActionFeedback(
+            level="warning",
+            title="Export packet is blocked.",
+            lines=(
+                str(exc),
+                "Complete or rerun the current questionnaire before exporting.",
+            ),
+        )
+    except Exception as exc:  # pragma: no cover - defensive UI resilience
+        return _generic_action_error_feedback("Export publication", exc)
+
+    _persist_export_packet(packet)
+    return ActionFeedback(
+        level="success",
+        title="Export packet published.",
+        lines=(
+            f"Output directory: {packet.output_dir}",
+            f"Answered questionnaire: {packet.answered_questionnaire_path}",
+            f"Review summary: {packet.review_summary_path}",
+            f"Needs-review CSV: {packet.needs_review_csv_path}",
+        ),
+    )
+
+
+def _render_export_packet_surface(packet: PublishedExportPacket | None) -> None:
+    """Render the current export packet state without implying stale trust."""
+    if packet is None:
+        completed_questionnaire = _last_run_questionnaire()
+        if completed_questionnaire is not None and completed_questionnaire.rows:
+            st.info(
+                "Publish the final export packet once you are satisfied with the current "
+                "answers, inspector, and review queue."
+            )
+        else:
+            st.info("Run the copilot before publishing the final export packet.")
+        return
+
+    st.success("The current run has a published export packet ready for handoff.")
+    st.markdown("**Published Output Paths**")
+    st.markdown(
+        "\n".join(
+            (
+                f"- Output directory: `{packet.output_dir}`",
+                f"- Answered questionnaire: `{packet.answered_questionnaire_path}`",
+                f"- Review summary: `{packet.review_summary_path}`",
+                f"- Needs-review CSV: `{packet.needs_review_csv_path}`",
+            )
+        )
+    )
+    st.caption(
+        f"Run {packet.run_id} | Completed at {packet.completed_at} | "
+        f"Workspace hash {packet.workspace_hash}"
+    )
+
+
 def _render_idle_run_state(
     run_state: RunSectionState,
     *,
@@ -917,7 +1042,7 @@ def render_workspace_section() -> WorkspaceSnapshot:
         "Prepare the curated runtime workspace, reuse the local evidence index when the "
         "manifest matches, and surface actionable recovery text when something drifts."
     )
-    actions_locked = _workspace_busy() or _run_busy()
+    actions_locked = _workspace_busy() or _run_busy() or _export_busy()
 
     load_clicked = st.button(
         "Load Demo Workspace",
@@ -978,7 +1103,7 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
     )
 
     run_state = _build_run_section_state(workspace_snapshot)
-    actions_locked = _workspace_busy() or _run_busy()
+    actions_locked = _workspace_busy() or _run_busy() or _export_busy()
 
     count_column, button_column = st.columns((0.9, 1.3))
     with count_column:
@@ -1049,6 +1174,49 @@ def render_run_section(workspace_snapshot: WorkspaceSnapshot) -> None:
     _render_feedback(st.session_state.get(RUN_ACTION_FEEDBACK_KEY))
 
 
+def render_export_section(workspace_snapshot: WorkspaceSnapshot) -> None:
+    """Render the final export step for the current completed run."""
+    st.subheader("Export Packet")
+    st.write(
+        "Publish the final answered workbook, review summary, and needs-review CSV into "
+        "the canonical outputs directory once the current run is complete."
+    )
+    completed_questionnaire = _last_run_questionnaire()
+    actions_locked = _workspace_busy() or _run_busy() or _export_busy()
+    can_export = (
+        completed_questionnaire is not None
+        and bool(completed_questionnaire.rows)
+        and workspace_snapshot.workspace_hash is not None
+        and not actions_locked
+    )
+    export_clicked = st.button(
+        "Publish Export Packet",
+        type="primary",
+        width="stretch",
+        disabled=not can_export,
+    )
+    if completed_questionnaire is None or not completed_questionnaire.rows:
+        st.caption("Finish a copilot run before publishing the export packet.")
+    elif workspace_snapshot.workspace_hash is None:
+        st.caption(
+            "Reload the demo workspace before exporting because the workspace hash is unavailable."
+        )
+    if actions_locked and not _export_busy():
+        st.caption("Another app action is finishing. Wait for it to complete before exporting.")
+
+    if export_clicked:
+        st.session_state[EXPORT_BUSY_KEY] = True
+        _clear_export_ui_state()
+        try:
+            with st.spinner("Publishing the final export packet..."):
+                _persist_export_feedback(_publish_export_packet_feedback(workspace_snapshot))
+        finally:
+            st.session_state[EXPORT_BUSY_KEY] = False
+
+    _render_feedback(st.session_state.get(EXPORT_ACTION_FEEDBACK_KEY))
+    _render_export_packet_surface(_export_packet())
+
+
 def main() -> None:
     """Run the Streamlit app."""
     st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -1062,6 +1230,7 @@ def main() -> None:
     )
     workspace_snapshot = render_workspace_section()
     render_run_section(workspace_snapshot)
+    render_export_section(workspace_snapshot)
 
 
 if __name__ == "__main__":
@@ -1073,6 +1242,7 @@ __all__ = [
     "APP_TITLE",
     "DEMO_MODE_LABEL",
     "main",
+    "render_export_section",
     "render_run_section",
     "render_workspace_section",
 ]

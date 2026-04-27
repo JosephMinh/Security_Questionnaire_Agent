@@ -128,6 +128,28 @@ def _citation(
     )
 
 
+def _published_export_packet(
+    *,
+    run_id: str,
+    output_dir: str = "data/outputs",
+    completed_at: str = "2026-04-27T22:30:00Z",
+    workspace_hash: str = "workspace-hash",
+    index_action: str = rag.INDEX_ACTION_REUSED,
+) -> rag.PublishedExportPacket:
+    """Build one published export packet fixture for app-level export tests."""
+    output_root = Path(output_dir)
+    return rag.PublishedExportPacket(
+        output_dir=output_root,
+        answered_questionnaire_path=output_root / rag.ANSWERED_QUESTIONNAIRE_FILE_NAME,
+        review_summary_path=output_root / rag.REVIEW_SUMMARY_FILE_NAME,
+        needs_review_csv_path=output_root / rag.NEEDS_REVIEW_FILE_NAME,
+        run_id=run_id,
+        completed_at=completed_at,
+        workspace_hash=workspace_hash,
+        index_action=index_action,
+    )
+
+
 class AppRunSectionTest(unittest.TestCase):
     """Verify the run-control UI stays wired to the canonical pipeline contract."""
 
@@ -372,6 +394,137 @@ class AppRunSectionTest(unittest.TestCase):
             "Set OPENAI_API_KEY in the shell or repo-local `.env` before running the copilot.",
             [caption.value for caption in at.caption],
         )
+
+    def test_export_section_requires_completed_run_before_publish(self) -> None:
+        """The export action should stay disabled until a completed run exists."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    at = AppTest.from_function(_run_app_main)
+                    at.run()
+
+        export_button = next(
+            button for button in at.button if button.label == "Publish Export Packet"
+        )
+        self.assertTrue(export_button.disabled)
+        self.assertIn(
+            "Finish a copilot run before publishing the export packet.",
+            [caption.value for caption in at.caption],
+        )
+
+    def test_export_section_publishes_packet_and_shows_output_paths(self) -> None:
+        """A completed run should publish the export packet and expose the canonical paths."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+        completed_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        completed_questionnaire.rows[0] = rag.update_row_with_answer_result(
+            completed_questionnaire.rows[0],
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_HIGH,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-export-001",
+        )
+        packet = _published_export_packet(run_id="demo-run-export-001")
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    with patch.object(app, "publish_export_packet", return_value=packet) as publish_mock:
+                        at = AppTest.from_function(_run_app_main)
+                        at.session_state[app.LAST_RUN_ID_KEY] = "demo-run-export-001"
+                        at.session_state[app.LAST_RUN_QUESTIONNAIRE_KEY] = completed_questionnaire
+                        at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = completed_questionnaire
+                        at.run()
+                        next(
+                            button
+                            for button in at.button
+                            if button.label == "Publish Export Packet"
+                        ).click()
+                        at.run()
+
+        publish_mock.assert_called_once_with(
+            completed_questionnaire,
+            workspace_hash="workspace-hash",
+        )
+        self.assertEqual(at.session_state[app.EXPORT_PACKET_KEY], packet)
+        self.assertTrue(any("Export packet published." in value for value in [success.value for success in at.success]))
+        markdown_values = [markdown.value for markdown in at.markdown]
+        self.assertTrue(any(str(packet.output_dir) in value for value in markdown_values))
+        self.assertTrue(
+            any(str(packet.answered_questionnaire_path) in value for value in markdown_values)
+        )
+        self.assertTrue(any(str(packet.review_summary_path) in value for value in markdown_values))
+        self.assertTrue(any(str(packet.needs_review_csv_path) in value for value in markdown_values))
+
+    def test_export_failure_clears_stale_packet_surface(self) -> None:
+        """A failed export attempt should clear stale packet state instead of implying success."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="Q01",
+                category="Encryption",
+                question="Is customer data encrypted at rest?",
+            )
+        )
+        completed_questionnaire = rag.prepare_questionnaire_run(questionnaire)
+        completed_questionnaire.rows[0] = rag.update_row_with_answer_result(
+            completed_questionnaire.rows[0],
+            _answer_result(
+                answer="Yes. Customer data is encrypted at rest.",
+                answer_type=rag.ANSWER_TYPE_SUPPORTED,
+                confidence_score=rag.SUPPORTED_WITH_TWO_PLUS_CITATIONS_SCORE,
+                confidence_band=rag.CONFIDENCE_BAND_HIGH,
+                status=rag.STATUS_READY_FOR_REVIEW,
+            ),
+            index_action=rag.INDEX_ACTION_REUSED,
+            run_id="demo-run-export-002",
+        )
+        stale_packet = _published_export_packet(run_id="stale-export-run")
+
+        with patch.object(app, "_workspace_snapshot", return_value=_ready_snapshot()):
+            with patch.object(app, "load_runtime_questionnaire", return_value=questionnaire):
+                with patch.object(app, "_missing_required_environment", return_value=()):
+                    with patch.object(
+                        app,
+                        "publish_export_packet",
+                        side_effect=ValueError("run contains mixed run ids"),
+                    ):
+                        at = AppTest.from_function(_run_app_main)
+                        at.session_state[app.LAST_RUN_ID_KEY] = "demo-run-export-002"
+                        at.session_state[app.LAST_RUN_QUESTIONNAIRE_KEY] = completed_questionnaire
+                        at.session_state[app.RESULTS_QUESTIONNAIRE_KEY] = completed_questionnaire
+                        at.session_state[app.EXPORT_PACKET_KEY] = stale_packet
+                        at.run()
+                        next(
+                            button
+                            for button in at.button
+                            if button.label == "Publish Export Packet"
+                        ).click()
+                        at.run()
+
+        self.assertNotIn(app.EXPORT_PACKET_KEY, at.session_state)
+        warning_values = [warning.value for warning in at.warning]
+        self.assertTrue(any("Export packet is blocked." in value for value in warning_values))
+        self.assertTrue(any("run contains mixed run ids" in value for value in warning_values))
+        markdown_values = [markdown.value for markdown in at.markdown]
+        self.assertFalse(any(str(stale_packet.output_dir) in value for value in markdown_values))
 
     def test_load_demo_workspace_clears_stale_results_surface(self) -> None:
         """Workspace reload should clear prior run results instead of leaving stale tables."""
