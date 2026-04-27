@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 from shlex import join as shell_join
 from typing import Any, Final, Mapping, Sequence
@@ -365,6 +366,22 @@ class ChromaCollectionHandle:
     persist_directory: Path
     client: Any
     collection: Any
+
+
+@dataclass(frozen=True)
+class ChromaReuseStatus:
+    """Report whether one persisted Chroma collection can be safely reused."""
+
+    collection_name: str
+    persist_directory: Path
+    workspace_hash: str | None
+    stored_workspace_hash: str | None
+    stored_chunk_count: int | None
+    actual_chunk_count: int
+    index_action: str
+    reusable: bool
+    reason: str
+    collection_handle: ChromaCollectionHandle | None = None
 
 
 @dataclass(frozen=True)
@@ -779,6 +796,29 @@ def runtime_evidence_directory() -> Path:
     return RUNTIME_EVIDENCE_DIR
 
 
+def runtime_manifest_path() -> Path:
+    """Return the current runtime workspace-manifest path."""
+    return DATA_DIR / MANIFEST_FILE_NAME
+
+
+def current_workspace_hash(manifest_path: Path | None = None) -> str:
+    """Read the current runtime workspace hash from the manifest file."""
+    path = manifest_path or runtime_manifest_path()
+    if not path.exists():
+        raise FileNotFoundError(
+            "Runtime workspace manifest is missing at "
+            f"{path}. Run `python generate_demo_data.py` before indexing."
+        )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    workspace_hash = payload.get("workspace_hash")
+    if not isinstance(workspace_hash, str) or not workspace_hash.strip():
+        raise ValueError(
+            f"Runtime workspace manifest {path} is missing a valid `workspace_hash`."
+        )
+    return workspace_hash
+
+
 def chroma_persist_directory(persist_directory: Path | None = None) -> Path:
     """Return the stable local persistence directory for the Chroma demo index."""
     if persist_directory is None:
@@ -796,6 +836,52 @@ def _import_chromadb() -> Any:
             "Install dependencies with `pip install -r requirements.txt`."
         ) from exc
     return chromadb
+
+
+def _collection_metadata(handle: ChromaCollectionHandle) -> dict[str, Any]:
+    """Return one mutable metadata mapping for the collection handle."""
+    metadata = handle.collection.metadata or {}
+    if not isinstance(metadata, dict):
+        return {}
+    return dict(metadata)
+
+
+def _existing_collection_names(client: Any) -> set[str]:
+    """Return the existing collection names for one Chroma client."""
+    return {
+        str(getattr(collection_item, "name", collection_item))
+        for collection_item in client.list_collections()
+    }
+
+
+def get_existing_chroma_collection(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+) -> ChromaCollectionHandle | None:
+    """Open one existing persistent Chroma collection without creating a new one."""
+    normalized_collection_name = collection_name.strip()
+    if not normalized_collection_name:
+        raise ValueError("collection_name must be a non-empty string.")
+
+    persistence_path = chroma_persist_directory(persist_directory)
+    if persistence_path.exists() and not persistence_path.is_dir():
+        raise ValueError("persist_directory must resolve to a directory path.")
+    if not persistence_path.exists():
+        return None
+
+    chromadb = _import_chromadb()
+    client = chromadb.PersistentClient(path=str(persistence_path))
+    if normalized_collection_name not in _existing_collection_names(client):
+        return None
+
+    collection = client.get_collection(name=normalized_collection_name)
+    return ChromaCollectionHandle(
+        collection_name=normalized_collection_name,
+        persist_directory=persistence_path,
+        client=client,
+        collection=collection,
+    )
 
 
 def get_or_create_chroma_collection(
@@ -831,6 +917,129 @@ def get_or_create_demo_chroma_collection(
     return get_or_create_chroma_collection(
         collection_name=COLLECTION_NAME,
         persist_directory=persist_directory,
+    )
+
+
+def record_indexed_workspace_state(
+    collection_handle: ChromaCollectionHandle,
+    *,
+    workspace_hash: str,
+    chunk_count: int,
+) -> dict[str, Any]:
+    """Record the last indexed workspace identity on the Chroma collection."""
+    metadata = _collection_metadata(collection_handle)
+    metadata["workspace_hash"] = workspace_hash
+    metadata["chunk_count"] = chunk_count
+    collection_handle.collection.modify(metadata=metadata)
+    return metadata
+
+
+def evaluate_chroma_reuse(
+    *,
+    collection_name: str = COLLECTION_NAME,
+    persist_directory: Path | None = None,
+    manifest_path: Path | None = None,
+) -> ChromaReuseStatus:
+    """Return whether the existing collection can be safely reused."""
+    try:
+        workspace_hash = current_workspace_hash(manifest_path)
+    except (FileNotFoundError, ValueError):
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=chroma_persist_directory(persist_directory),
+            workspace_hash=None,
+            stored_workspace_hash=None,
+            stored_chunk_count=None,
+            actual_chunk_count=0,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="manifest_unavailable",
+            collection_handle=None,
+        )
+
+    collection_handle = get_existing_chroma_collection(
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+    )
+    if collection_handle is None:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=chroma_persist_directory(persist_directory),
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=None,
+            stored_chunk_count=None,
+            actual_chunk_count=0,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="collection_missing",
+            collection_handle=None,
+        )
+
+    metadata = _collection_metadata(collection_handle)
+    stored_workspace_hash = metadata.get("workspace_hash")
+    raw_stored_chunk_count = metadata.get("chunk_count")
+    stored_chunk_count = (
+        raw_stored_chunk_count
+        if isinstance(raw_stored_chunk_count, int) and raw_stored_chunk_count >= 0
+        else None
+    )
+    actual_chunk_count = int(collection_handle.collection.count())
+
+    if stored_workspace_hash != workspace_hash:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=(
+                stored_workspace_hash if isinstance(stored_workspace_hash, str) else None
+            ),
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="workspace_hash_mismatch",
+            collection_handle=collection_handle,
+        )
+
+    if stored_chunk_count is None:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=None,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="chunk_count_missing",
+            collection_handle=collection_handle,
+        )
+
+    if actual_chunk_count != stored_chunk_count or actual_chunk_count == 0:
+        return ChromaReuseStatus(
+            collection_name=collection_name,
+            persist_directory=collection_handle.persist_directory,
+            workspace_hash=workspace_hash,
+            stored_workspace_hash=workspace_hash,
+            stored_chunk_count=stored_chunk_count,
+            actual_chunk_count=actual_chunk_count,
+            index_action=INDEX_ACTION_BLOCKED,
+            reusable=False,
+            reason="integrity_check_failed",
+            collection_handle=collection_handle,
+        )
+
+    return ChromaReuseStatus(
+        collection_name=collection_name,
+        persist_directory=collection_handle.persist_directory,
+        workspace_hash=workspace_hash,
+        stored_workspace_hash=workspace_hash,
+        stored_chunk_count=stored_chunk_count,
+        actual_chunk_count=actual_chunk_count,
+        index_action=INDEX_ACTION_REUSED,
+        reusable=True,
+        reason="reused",
+        collection_handle=collection_handle,
     )
 
 
@@ -1156,6 +1365,7 @@ def persist_curated_evidence_chunks(
     collection_name: str = COLLECTION_NAME,
     persist_directory: Path | None = None,
     evidence_dir: Path | None = None,
+    manifest_path: Path | None = None,
 ) -> tuple[EvidenceChunk, ...]:
     """Persist the canonical curated chunk set into the stable Chroma collection."""
     collection_handle = get_or_create_chroma_collection(
@@ -1163,7 +1373,13 @@ def persist_curated_evidence_chunks(
         persist_directory=persist_directory,
     )
     chunks = build_curated_evidence_chunks(evidence_dir)
-    return persist_evidence_chunks(collection_handle, chunks)
+    persisted_chunks = persist_evidence_chunks(collection_handle, chunks)
+    record_indexed_workspace_state(
+        collection_handle,
+        workspace_hash=current_workspace_hash(manifest_path),
+        chunk_count=len(persisted_chunks),
+    )
+    return persisted_chunks
 
 
 def _parse_evidence_display_value(value: str) -> list[str]:
@@ -1340,6 +1556,7 @@ __all__ = [
     "CANONICAL_VERIFICATION_COMMANDS",
     "CHROMA_DIR",
     "ChromaCollectionHandle",
+    "ChromaReuseStatus",
     "CHUNK_OVERLAP_CHARS",
     "CHUNK_SIZE_CHARS",
     "COLLECTION_NAME",
@@ -1453,6 +1670,9 @@ __all__ = [
     "chunk_evidence_document",
     "chunk_evidence_documents",
     "confidence_band_for_score",
+    "current_workspace_hash",
+    "evaluate_chroma_reuse",
+    "get_existing_chroma_collection",
     "get_or_create_chroma_collection",
     "get_or_create_demo_chroma_collection",
     "load_curated_pdf_evidence_documents",
@@ -1468,9 +1688,11 @@ __all__ = [
     "persist_curated_evidence_chunks",
     "persist_evidence_chunks",
     "question_order_index",
+    "record_indexed_workspace_state",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
     "runtime_evidence_directory",
+    "runtime_manifest_path",
     "runtime_questionnaire_path",
     "verification_command_by_name",
     "verification_sequence_shell_commands",
