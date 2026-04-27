@@ -41,6 +41,29 @@ class RunDeterministicDemoScriptTest(unittest.TestCase):
             for question in fixture["questions"]
         }
 
+    def _assert_result_matches_expected_fixture(
+        self,
+        question_id: str,
+        result: rag.GeneratedAnswerResult,
+    ) -> None:
+        """Assert one deterministic helper result stays aligned to the expected fixture."""
+
+        expected = self.questions_by_id[question_id]
+        self.assertEqual(result.answer_type, expected["expected_answer_type"])
+        self.assertEqual(result.status, expected["expected_status"])
+        self.assertIn(result.confidence_band, expected["allowed_confidence_bands"])
+        self.assertTrue(result.answer.startswith(expected["expected_opening_token"]))
+
+        if expected["expected_status"] == rag.STATUS_NEEDS_REVIEW:
+            self.assertEqual(result.reviewer_note, expected["rationale"])
+        else:
+            self.assertEqual(result.reviewer_note, "")
+
+        if expected.get("primary_source") is None:
+            self.assertEqual(len(result.citations), 0)
+        else:
+            self.assertEqual(len(result.citations), 1)
+
     def test_citation_helper_preserves_markdown_section_and_pdf_page(self) -> None:
         """Primary-source citations should expose stable reviewer-facing provenance."""
 
@@ -84,29 +107,9 @@ class RunDeterministicDemoScriptTest(unittest.TestCase):
                 self.questions_by_id["Q19"]
             )
 
-        self.assertEqual(supported.answer_type, rag.ANSWER_TYPE_SUPPORTED)
-        self.assertEqual(supported.status, rag.STATUS_READY_FOR_REVIEW)
-        self.assertEqual(supported.confidence_band, rag.CONFIDENCE_BAND_MEDIUM)
-        self.assertEqual(supported.reviewer_note, "")
-        self.assertEqual(len(supported.citations), 1)
-        self.assertTrue(supported.answer.startswith("Yes."))
-
-        self.assertEqual(partial.answer_type, rag.ANSWER_TYPE_PARTIAL)
-        self.assertEqual(partial.status, rag.STATUS_NEEDS_REVIEW)
-        self.assertEqual(partial.confidence_band, rag.CONFIDENCE_BAND_LOW)
-        self.assertEqual(partial.reviewer_note, self.questions_by_id["Q17"]["rationale"])
-        self.assertEqual(len(partial.citations), 1)
-        self.assertTrue(partial.answer.startswith("Partially."))
-
-        self.assertEqual(unsupported.answer_type, rag.ANSWER_TYPE_UNSUPPORTED)
-        self.assertEqual(unsupported.status, rag.STATUS_NEEDS_REVIEW)
-        self.assertEqual(unsupported.confidence_band, rag.CONFIDENCE_BAND_LOW)
-        self.assertEqual(
-            unsupported.reviewer_note,
-            self.questions_by_id["Q19"]["rationale"],
-        )
-        self.assertEqual(len(unsupported.citations), 0)
-        self.assertTrue(unsupported.answer.startswith("Not stated."))
+        self._assert_result_matches_expected_fixture("Q01", supported)
+        self._assert_result_matches_expected_fixture("Q17", partial)
+        self._assert_result_matches_expected_fixture("Q19", unsupported)
 
     def test_canonical_smoke_triad_matches_expected_fixture(self) -> None:
         """The Q01/Q17/Q21 smoke triad should preserve the planned support matrix."""
@@ -116,26 +119,9 @@ class RunDeterministicDemoScriptTest(unittest.TestCase):
             q17 = self.script._answer_result_for_expected(self.questions_by_id["Q17"])
             q21 = self.script._answer_result_for_expected(self.questions_by_id["Q21"])
 
-        self.assertEqual(q01.answer_type, rag.ANSWER_TYPE_SUPPORTED)
-        self.assertEqual(q01.status, rag.STATUS_READY_FOR_REVIEW)
-        self.assertEqual(q01.confidence_band, rag.CONFIDENCE_BAND_MEDIUM)
-        self.assertEqual(q01.reviewer_note, "")
-        self.assertEqual(len(q01.citations), 1)
-        self.assertTrue(q01.answer.startswith("Yes."))
-
-        self.assertEqual(q17.answer_type, rag.ANSWER_TYPE_PARTIAL)
-        self.assertEqual(q17.status, rag.STATUS_NEEDS_REVIEW)
-        self.assertEqual(q17.confidence_band, rag.CONFIDENCE_BAND_LOW)
-        self.assertEqual(q17.reviewer_note, self.questions_by_id["Q17"]["rationale"])
-        self.assertEqual(len(q17.citations), 1)
-        self.assertTrue(q17.answer.startswith("Partially."))
-
-        self.assertEqual(q21.answer_type, rag.ANSWER_TYPE_UNSUPPORTED)
-        self.assertEqual(q21.status, rag.STATUS_NEEDS_REVIEW)
-        self.assertEqual(q21.confidence_band, rag.CONFIDENCE_BAND_LOW)
-        self.assertEqual(q21.reviewer_note, self.questions_by_id["Q21"]["rationale"])
-        self.assertEqual(len(q21.citations), 0)
-        self.assertTrue(q21.answer.startswith("Not stated."))
+        self._assert_result_matches_expected_fixture("Q01", q01)
+        self._assert_result_matches_expected_fixture("Q17", q17)
+        self._assert_result_matches_expected_fixture("Q21", q21)
 
     def test_clear_stale_publish_artifacts_removes_only_deterministic_rerun_paths(self) -> None:
         """Deterministic reruns should clear only their own stale backup/staging dirs."""
