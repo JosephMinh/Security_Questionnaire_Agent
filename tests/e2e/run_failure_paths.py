@@ -88,12 +88,50 @@ class JsonlLogger:
             print(line)
 
     def capture_rag_event(self, record: dict[str, object]) -> None:
+        run_id = record.get("run_id")
+        question_id = record.get("question_id")
+        workspace_hash = record.get("workspace_hash")
+        manifest_hash = record.get("manifest_hash")
+        index_action = record.get("index_action")
+        retrieved_chunk_count = record.get("retrieved_chunk_count")
+        valid_citation_count = record.get("valid_citation_count")
+        answer_type = record.get("answer_type")
+        confidence_band = record.get("confidence_band")
+        review_status = record.get("review_status")
+        retry_attempt = record.get("retry_attempt")
+        artifact_path = record.get("artifact_path")
+        reason = record.get("reason")
         self.emit(
             component="rag",
             event=str(record.get("event", "unknown")),
             status=str(record.get("status", "unknown")),
             message=str(record.get("message", "")),
             level=str(record.get("level", "INFO")),
+            run_id=str(run_id) if run_id is not None else None,
+            question_id=str(question_id) if question_id is not None else None,
+            workspace_hash=str(workspace_hash) if workspace_hash is not None else None,
+            manifest_hash=str(manifest_hash) if manifest_hash is not None else None,
+            index_action=str(index_action) if index_action is not None else None,
+            retrieved_chunk_count=(
+                int(retrieved_chunk_count)
+                if isinstance(retrieved_chunk_count, int)
+                else None
+            ),
+            valid_citation_count=(
+                int(valid_citation_count)
+                if isinstance(valid_citation_count, int)
+                else None
+            ),
+            answer_type=str(answer_type) if answer_type is not None else None,
+            confidence_band=(
+                str(confidence_band) if confidence_band is not None else None
+            ),
+            review_status=str(review_status) if review_status is not None else None,
+            retry_attempt=(
+                int(retry_attempt) if isinstance(retry_attempt, int) else None
+            ),
+            artifact_path=artifact_path,
+            reason=str(reason) if reason is not None else None,
             source_component=record.get("component"),
             rag_record=record,
         )

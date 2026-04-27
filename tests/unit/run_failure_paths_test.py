@@ -100,7 +100,19 @@ class RunFailurePathsScriptTest(unittest.TestCase):
                     "status": "completed",
                     "level": "INFO",
                     "message": "Completed Q01 as supported.",
+                    "run_id": "failure-e2e-run",
                     "question_id": "Q01",
+                    "workspace_hash": "workspace-hash",
+                    "manifest_hash": "manifest-hash",
+                    "index_action": rag.INDEX_ACTION_REUSED,
+                    "retrieved_chunk_count": 4,
+                    "valid_citation_count": 1,
+                    "answer_type": rag.ANSWER_TYPE_SUPPORTED,
+                    "confidence_band": rag.CONFIDENCE_BAND_MEDIUM,
+                    "review_status": rag.STATUS_READY_FOR_REVIEW,
+                    "retry_attempt": 0,
+                    "artifact_path": Path("data/outputs/failure.jsonl"),
+                    "reason": "reused",
                 }
             )
 
@@ -116,6 +128,19 @@ class RunFailurePathsScriptTest(unittest.TestCase):
         self.assertEqual(records[0]["phase"], "setup")
         self.assertEqual(records[1]["component"], "rag")
         self.assertEqual(records[1]["event"], "row_completed")
+        self.assertEqual(records[1]["run_id"], "failure-e2e-run")
+        self.assertEqual(records[1]["question_id"], "Q01")
+        self.assertEqual(records[1]["workspace_hash"], "workspace-hash")
+        self.assertEqual(records[1]["manifest_hash"], "manifest-hash")
+        self.assertEqual(records[1]["index_action"], rag.INDEX_ACTION_REUSED)
+        self.assertEqual(records[1]["retrieved_chunk_count"], 4)
+        self.assertEqual(records[1]["valid_citation_count"], 1)
+        self.assertEqual(records[1]["answer_type"], rag.ANSWER_TYPE_SUPPORTED)
+        self.assertEqual(records[1]["confidence_band"], rag.CONFIDENCE_BAND_MEDIUM)
+        self.assertEqual(records[1]["review_status"], rag.STATUS_READY_FOR_REVIEW)
+        self.assertEqual(records[1]["retry_attempt"], 0)
+        self.assertEqual(records[1]["artifact_path"], "data/outputs/failure.jsonl")
+        self.assertEqual(records[1]["reason"], "reused")
         self.assertEqual(records[1]["source_component"], "pipeline")
         self.assertEqual(records[1]["rag_record"]["question_id"], "Q01")
 
