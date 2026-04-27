@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -106,6 +107,30 @@ class RunDeterministicDemoScriptTest(unittest.TestCase):
         )
         self.assertEqual(len(unsupported.citations), 0)
         self.assertTrue(unsupported.answer.startswith("Not stated."))
+
+    def test_clear_stale_publish_artifacts_removes_only_deterministic_rerun_paths(self) -> None:
+        """Deterministic reruns should clear only their own stale backup/staging dirs."""
+
+        with TemporaryDirectory() as tmp_dir_name:
+            output_dir = Path(tmp_dir_name) / "deterministic_demo_packet"
+            backup_dir = self.script._deterministic_backup_dir(output_dir)
+            staging_dir = output_dir.parent / (
+                f".{output_dir.name}-staging-{rag._safe_filesystem_token(self.script.RUN_ID)}-demo"
+            )
+            unrelated_dir = output_dir.parent / ".deterministic_demo_packet-staging-other-run-demo"
+            backup_dir.mkdir(parents=True)
+            staging_dir.mkdir(parents=True)
+            unrelated_dir.mkdir(parents=True)
+
+            removed_paths = self.script._clear_stale_publish_artifacts(output_dir)
+
+            self.assertEqual(
+                removed_paths,
+                (backup_dir, staging_dir),
+            )
+            self.assertFalse(backup_dir.exists())
+            self.assertFalse(staging_dir.exists())
+            self.assertTrue(unrelated_dir.exists())
 
 
 if __name__ == "__main__":

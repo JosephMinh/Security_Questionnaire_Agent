@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 from pathlib import Path
+import shutil
 import sys
 from typing import Final
 from unittest.mock import patch
@@ -94,6 +95,35 @@ def _contains_text(values: list[str], expected_substring: str) -> bool:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def _deterministic_backup_dir(output_dir: Path) -> Path:
+    """Return the one stable backup dir name used by the deterministic publish path."""
+    return output_dir.parent / (
+        f".{output_dir.name}-backup-"
+        f"{rag._safe_filesystem_token(RUN_ID)}-"
+        f"{rag._safe_filesystem_token(COMPLETED_AT)}"
+    )
+
+
+def _clear_stale_publish_artifacts(output_dir: Path) -> tuple[Path, ...]:
+    """Remove stale deterministic backup/staging dirs so the verifier stays rerunnable."""
+    removed_paths: list[Path] = []
+
+    backup_dir = _deterministic_backup_dir(output_dir)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+        removed_paths.append(backup_dir)
+
+    staging_pattern = (
+        f".{output_dir.name}-staging-{rag._safe_filesystem_token(RUN_ID)}-*"
+    )
+    for staging_dir in sorted(output_dir.parent.glob(staging_pattern)):
+        if staging_dir.is_dir():
+            shutil.rmtree(staging_dir)
+            removed_paths.append(staging_dir)
+
+    return tuple(removed_paths)
 
 
 class JsonlLogSink:
@@ -701,6 +731,7 @@ def run_suite(
     verbose: bool,
 ) -> Path:
     """Execute the deterministic golden-path suite and write JSONL logs."""
+    removed_paths = _clear_stale_publish_artifacts(output_dir)
     log_sink = JsonlLogSink(log_path=log_dir / LOG_FILE_NAME, verbose=verbose)
     expected_fixture = _load_expected_fixture()
     expected_questions = tuple(expected_fixture["questions"])
@@ -713,6 +744,15 @@ def run_suite(
         run_id=RUN_ID,
         artifact_path=log_dir / LOG_FILE_NAME,
     )
+    if removed_paths:
+        log_sink.emit(
+            event="publish_artifacts_reset",
+            status=rag.LOG_STATUS_COMPLETED,
+            message="Removed stale deterministic export artifacts before rerunning the suite.",
+            run_id=RUN_ID,
+            artifact_path=output_dir,
+            reason="rerun_preflight",
+        )
     questionnaire, workspace_hash, evidence_count = _ensure_workspace_ready(log_sink)
     _require(
         questionnaire.question_ids()
