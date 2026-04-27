@@ -379,6 +379,31 @@ class EvidenceChunk:
 
 
 @dataclass(frozen=True)
+class RetrievedEvidenceChunk:
+    """One retrieved evidence chunk with prompt-ready metadata."""
+
+    chunk_id: str
+    source: str
+    source_path: Path
+    doc_type: str
+    text: str
+    rank: int
+    distance: float | None = None
+    section: str | None = None
+    page: int | None = None
+
+    def metadata(self) -> dict[str, str | int | None]:
+        """Return one stable metadata payload for prompt and citation stages."""
+        return {
+            "chunk_id": self.chunk_id,
+            "source": self.source,
+            "doc_type": self.doc_type,
+            "section": self.section,
+            "page": self.page,
+        }
+
+
+@dataclass(frozen=True)
 class ChromaCollectionHandle:
     """One stable handle to the demo's persistent Chroma collection."""
 
@@ -1829,6 +1854,184 @@ def ensure_curated_evidence_index(
     return _index_status_from_reuse_status(reuse_status)
 
 
+def _require_ready_collection_handle(
+    index_status: ChromaIndexStatus,
+) -> ChromaCollectionHandle:
+    """Return the validated collection handle required for retrieval."""
+    if not index_status.ready or index_status.collection_handle is None:
+        raise ValueError(
+            "The curated evidence index is not ready for retrieval. Run "
+            "`ensure_curated_evidence_index()` and confirm it returned a ready "
+            "status before retrieving evidence."
+        )
+    return index_status.collection_handle
+
+
+def _question_identifier(row_like: Mapping[str, object]) -> str:
+    """Return one best-effort row identifier for retrieval errors."""
+    raw_question_id = row_like.get("question_id", row_like.get("Question ID", ""))
+    if isinstance(raw_question_id, str) and raw_question_id.strip():
+        return raw_question_id.strip()
+    return "<unknown-question>"
+
+
+def retrieve_evidence_chunks(
+    question_text: str,
+    *,
+    index_status: ChromaIndexStatus,
+    top_k: int = RETRIEVAL_TOP_K,
+) -> tuple[RetrievedEvidenceChunk, ...]:
+    """Retrieve up to five unique evidence chunks for one question string."""
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer.")
+
+    normalized_question_text = question_text.strip()
+    if not normalized_question_text:
+        raise ValueError("question_text must be a non-empty string.")
+
+    collection_handle = _require_ready_collection_handle(index_status)
+    query_limit = min(max(top_k * 2, top_k), index_status.actual_chunk_count)
+    if query_limit <= 0:
+        return ()
+
+    payload = collection_handle.collection.query(
+        query_texts=[normalized_question_text],
+        n_results=query_limit,
+        include=["documents", "metadatas", "distances"],
+    )
+    raw_ids = payload.get("ids")
+    raw_documents = payload.get("documents")
+    raw_metadatas = payload.get("metadatas")
+    raw_distances = payload.get("distances")
+    if not (
+        isinstance(raw_ids, list)
+        and len(raw_ids) == 1
+        and isinstance(raw_documents, list)
+        and len(raw_documents) == 1
+        and isinstance(raw_metadatas, list)
+        and len(raw_metadatas) == 1
+    ):
+        raise RuntimeError(
+            "Chroma query returned an unexpected payload shape for evidence retrieval."
+        )
+
+    ids = raw_ids[0]
+    documents = raw_documents[0]
+    metadatas = raw_metadatas[0]
+    if not (
+        isinstance(ids, list) and isinstance(documents, list) and isinstance(metadatas, list)
+    ):
+        raise RuntimeError(
+            "Chroma query returned a malformed retrieval payload for evidence retrieval."
+        )
+
+    if isinstance(raw_distances, list) and len(raw_distances) == 1 and isinstance(
+        raw_distances[0], list
+    ):
+        distances: list[object | None] = list(raw_distances[0])
+    else:
+        distances = [None] * len(ids)
+
+    if not (len(ids) == len(documents) == len(metadatas) == len(distances)):
+        raise RuntimeError(
+            "Chroma query returned mismatched retrieval result lengths for the current "
+            "question."
+        )
+
+    retrieved_chunks: list[RetrievedEvidenceChunk] = []
+    seen_chunk_ids: set[str] = set()
+    for raw_id, raw_document, raw_metadata, raw_distance in zip(
+        ids,
+        documents,
+        metadatas,
+        distances,
+    ):
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise RuntimeError("Chroma query returned a retrieval candidate without an id.")
+        if not isinstance(raw_document, str) or not raw_document.strip():
+            raise RuntimeError(
+                f"Chroma query returned an empty document for retrieval candidate {raw_id!r}."
+            )
+        if not isinstance(raw_metadata, dict):
+            raise RuntimeError(
+                f"Chroma query returned missing metadata for retrieval candidate {raw_id!r}."
+            )
+
+        chunk_id = raw_metadata.get("chunk_id")
+        if not isinstance(chunk_id, str) or not chunk_id.strip():
+            raise RuntimeError(
+                f"Chroma query returned candidate {raw_id!r} without a valid logical chunk id."
+            )
+        if chunk_id in seen_chunk_ids:
+            continue
+
+        source_name = raw_metadata.get("source")
+        if not isinstance(source_name, str) or not source_name.strip():
+            raise RuntimeError(
+                f"Chroma query returned candidate {chunk_id!r} without a valid source."
+            )
+
+        doc_type = raw_metadata.get("doc_type")
+        if not isinstance(doc_type, str) or not doc_type.strip():
+            raise RuntimeError(
+                f"Chroma query returned candidate {chunk_id!r} without a valid doc_type."
+            )
+
+        section = raw_metadata.get("section")
+        if section is not None and not isinstance(section, str):
+            raise RuntimeError(
+                f"Chroma query returned candidate {chunk_id!r} with a non-string section."
+            )
+        page = raw_metadata.get("page")
+        if page is not None and not isinstance(page, int):
+            raise RuntimeError(
+                f"Chroma query returned candidate {chunk_id!r} with a non-integer page."
+            )
+
+        distance: float | None = None
+        if isinstance(raw_distance, (int, float)):
+            distance = float(raw_distance)
+
+        seen_chunk_ids.add(chunk_id)
+        retrieved_chunks.append(
+            RetrievedEvidenceChunk(
+                chunk_id=chunk_id,
+                source=source_name,
+                source_path=runtime_evidence_directory() / source_name,
+                doc_type=doc_type,
+                text=raw_document,
+                rank=len(retrieved_chunks) + 1,
+                distance=distance,
+                section=section,
+                page=page,
+            )
+        )
+        if len(retrieved_chunks) >= top_k:
+            break
+
+    return tuple(retrieved_chunks)
+
+
+def retrieve_evidence_chunks_for_row(
+    row_like: Mapping[str, object],
+    *,
+    index_status: ChromaIndexStatus,
+    top_k: int = RETRIEVAL_TOP_K,
+) -> tuple[RetrievedEvidenceChunk, ...]:
+    """Retrieve evidence using the canonical question text stored on one row."""
+    raw_question_text = row_like.get("question", row_like.get("Question", ""))
+    if not isinstance(raw_question_text, str) or not raw_question_text.strip():
+        raise ValueError(
+            "Question row "
+            f"{_question_identifier(row_like)} is missing a usable question string."
+        )
+    return retrieve_evidence_chunks(
+        raw_question_text,
+        index_status=index_status,
+        top_k=top_k,
+    )
+
+
 def _parse_evidence_display_value(value: str) -> list[str]:
     """Split the friendly workbook evidence cell into individual labels."""
     return [label for label in value.split("; ") if label]
@@ -2080,6 +2283,7 @@ __all__ = [
     "REVIEW_QUEUE_THRESHOLD",
     "REVIEW_STATUS_FILL",
     "REVIEW_SUMMARY_FILE_NAME",
+    "RetrievedEvidenceChunk",
     "RUNTIME_DIRECTORIES",
     "RUNTIME_EVIDENCE_DIR",
     "RUNTIME_QUESTIONNAIRES_DIR",
@@ -2141,6 +2345,8 @@ __all__ = [
     "question_order_index",
     "rebuild_curated_evidence_index",
     "record_indexed_workspace_state",
+    "retrieve_evidence_chunks",
+    "retrieve_evidence_chunks_for_row",
     "review_priority_sort_key",
     "RuntimeQuestionnaire",
     "runtime_evidence_directory",
