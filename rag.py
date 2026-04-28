@@ -1015,6 +1015,15 @@ def question_order_index(question_id: str) -> int:
     return EXPECTED_QUESTION_IDS.index(question_id)
 
 
+def question_order_sort_key(question_id: str) -> tuple[int, str]:
+    """Return a canonical-first sort key that degrades safely for unexpected ids."""
+    normalized_question_id = question_id.strip()
+    try:
+        return (question_order_index(normalized_question_id), normalized_question_id)
+    except ValueError:
+        return (len(EXPECTED_QUESTION_IDS), normalized_question_id)
+
+
 def confidence_band_for_score(confidence_score: float) -> str:
     """Map a numeric confidence score into the planned display band."""
     if confidence_score >= HIGH_CONFIDENCE_THRESHOLD:
@@ -4001,10 +4010,11 @@ def load_runtime_questionnaire(
     )
 
 
-def review_priority_sort_key(row_like: Mapping[str, object]) -> tuple[float, int]:
+def review_priority_sort_key(row_like: Mapping[str, object]) -> tuple[float, int, str]:
     """Sort review rows by ascending confidence and then questionnaire order."""
     question_id = str(row_like["question_id"])
-    return (float(row_like["confidence_score"]), question_order_index(question_id))
+    question_order, normalized_question_id = question_order_sort_key(question_id)
+    return (float(row_like["confidence_score"]), question_order, normalized_question_id)
 
 
 def verification_command_by_name(command_name: str) -> VerificationCommand:

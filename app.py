@@ -42,7 +42,7 @@ from rag import (
     evaluate_chroma_reuse,
     load_runtime_questionnaire,
     publish_export_packet,
-    question_order_index,
+    question_order_sort_key,
     run_questionnaire_answer_pipeline,
 )
 
@@ -555,10 +555,10 @@ def _confidence_score_for_row(row_like: Mapping[str, object]) -> float:
         return 0.0
 
 
-def _question_order_for_row(row_like: Mapping[str, object]) -> int:
-    """Return the canonical workbook order for one visible or internal row mapping."""
+def _question_order_for_row(row_like: Mapping[str, object]) -> tuple[int, str]:
+    """Return a stable canonical-first sort key for one visible or internal row mapping."""
     raw_question_id = row_like.get("question_id", row_like.get("Question ID", ""))
-    return question_order_index(str(raw_question_id))
+    return question_order_sort_key(str(raw_question_id))
 
 
 def _review_queue_rows(

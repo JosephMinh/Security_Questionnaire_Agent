@@ -308,6 +308,60 @@ class RagExportTest(unittest.TestCase):
                 ],
             )
 
+    def test_review_exports_degrade_safely_for_unexpected_question_ids(self):
+        """Review exports should stay readable even when question ids fall outside the curated set."""
+        questionnaire = _runtime_questionnaire(
+            _runtime_row(
+                question_id="B",
+                category="Two",
+                question="Second synthetic question?",
+            ),
+            _runtime_row(
+                question_id="A",
+                category="One",
+                question="First synthetic question?",
+            ),
+        )
+        for row_index, question_id in enumerate(("B", "A")):
+            questionnaire.rows[row_index] = rag.update_row_with_answer_result(
+                questionnaire.rows[row_index],
+                _answer_result(
+                    answer="Partially stated.",
+                    answer_type=rag.ANSWER_TYPE_PARTIAL,
+                    citation_ids=(),
+                    citations=(),
+                    confidence_score=rag.PARTIAL_SCORE,
+                    confidence_band=rag.CONFIDENCE_BAND_MEDIUM,
+                    status=rag.STATUS_NEEDS_REVIEW,
+                    reviewer_note=f"Review {question_id}.",
+                ),
+                index_action=rag.INDEX_ACTION_REUSED,
+                run_id="run-unexpected-order",
+            )
+
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            summary_path = rag.write_review_summary(
+                questionnaire,
+                output_dir=output_dir,
+                completed_at="2026-04-27T22:44:00Z",
+                workspace_hash="workspace-hash-unexpected",
+            )
+            csv_path = rag.write_needs_review_csv(
+                questionnaire,
+                output_dir=output_dir,
+            )
+
+            summary_lines = summary_path.read_text(encoding="utf-8").splitlines()
+            self.assertLess(
+                summary_lines.index("- A: Review A."),
+                summary_lines.index("- B: Review B."),
+            )
+
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["Question ID"] for row in rows], ["A", "B"])
+
     def test_publish_export_packet_swaps_in_a_coherent_run_and_returns_paths(self):
         """Successful publish should replace the packet as a unit and preserve a backup."""
         questionnaire = _runtime_questionnaire(
